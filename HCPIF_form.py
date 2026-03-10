@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HCPIF extractor R2.6
+HCPIF extractor R2.6 + OCR fallback
 
 - Base: R2.4 (robust, Unicode-safe, anti-signature & anti-date, smart transliteration)
 - R2.5: Integração com WEBADI preservando macros/estrutura; mantém "Preferred Language" e "BATCH_NAME".
@@ -10,25 +10,28 @@ HCPIF extractor R2.6
   * Busca de cabeçalho a partir da linha 5 (parametrizável).
   * CLI para nome da aba, linha inicial do cabeçalho e debug.
 
-Ajustes solicitados:
-- Quando --webadi_template for informado e --webadi_output não for, a saída será
-  um novo arquivo na mesma pasta do template, com nome:
-    OC WEBADI MMDDYYYY.xlsm  (ex.: OC WEBADI 03022026.xlsm).
-- Somente a coluna BILL_TO deve vir com "BILL_TO" (localizada pelo cabeçalho; fallback na coluna Q);
-  se existir cabeçalho "SITE_PURPOSE", também recebe "BILL_TO".
-- Demais colunas são preenchidas a partir dos PDFs + mapeamento pelas colunas do WEBADI.
-- Linha 3 da aba WebADI:
-    B3 = BATCH_NAME        (mantido)
-    D3 = * Text            (mantido)
-    E3 = OC MMDDYYYY       (atualizado; remove "MS BRUNER" e cia)
+Extras:
+- OCR fallback via Tesseract + pdf2image para PDFs com texto embaralhado.
+- Limpeza de caracteres lixo no início dos campos (datas, currency, e‑mails etc.).
+- Normalização de Today's date, Effective Date of Change e Currency, com fallbacks.
 """
 
 # -------------------- DEFAULT PATHS --------------------
+from pathlib import Path
+
 DEFAULT_INPUT_DIR = r"C:\Users\josenjr\Downloads\HCPIFs"
 DEFAULT_OUTPUT_FILE = r"C:\Users\josenjr\Downloads\HCPIFs\Output\HCPIF_extraction.xlsx"
 
 # Template padrão (arquivo com macros boas)
 DEFAULT_WEBADI_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OC WebADI SF 149540900 2-13-26 (002).xlsm"
+
+# -------------------- POPPLER / TESSERACT CONFIG --------------------
+# Poppler (onde está pdfinfo.exe)
+POPPLER_PATH = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Poppler\poppler-25.12.0\Library\bin"
+
+# Tesseract (executável) + tessdata (eng.traineddata)
+TESSERACT_EXE = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\tesseract.exe"
+TESSDATA_PREFIX = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\tessdata"
 
 # -------------------- ENSURE / INSTALL DEPS --------------------
 import sys
@@ -37,7 +40,7 @@ import importlib
 import argparse
 import copy
 import re
-from pathlib import Path
+import os
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -48,6 +51,8 @@ REQUIRED = [
     ("tqdm", "tqdm"),
     ("Unidecode", "unidecode"),
     ("pycountry", "pycountry"),
+    ("pytesseract", "pytesseract"),
+    ("pdf2image", "pdf2image"),
 ]
 
 def ensure_package(pip_name: str, import_name: str):
@@ -63,7 +68,14 @@ pd = ensure_package("pandas", "pandas")
 openpyxl = ensure_package("openpyxl", "openpyxl")
 tqdm = ensure_package("tqdm", "tqdm")
 unidecode_mod = ensure_package("Unidecode", "unidecode")
+pytesseract = ensure_package("pytesseract", "pytesseract")
+pdf2image = ensure_package("pdf2image", "pdf2image")
 from unidecode import unidecode  # noqa: E402
+from pdf2image import convert_from_path  # noqa: E402
+
+# Configura Tesseract e TESSDATA_PREFIX
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+os.environ["TESSDATA_PREFIX"] = TESSDATA_PREFIX
 
 try:
     pycountry = ensure_package("pycountry", "pycountry")
@@ -142,6 +154,47 @@ BARRIER_LABELS = ALL_LABELS + [r"signature", r"signed", r"signee", r"signer"]
 NEXT_LABEL_BARRIER = re.compile(r"(?i)\b(?:" + "|".join(BARRIER_LABELS) + r")\b\s*:?")
 LABEL_LINE_RE = re.compile(r"(?im)^\s*(?:" + "|".join(BARRIER_LABELS) + r")\s*:?\b")
 
+# Moedas esperadas nesse fluxo (pra filtrar lixo tipo COM)
+KNOWN_CURRENCIES = {
+    "USD",
+    "EUR",
+    "MXN",
+    "CHF",
+    "THB",
+    "AUD",
+    "GBP",
+    "NOK",
+    "SEK",
+    "DKK",
+    "CZK",
+    "PLN",
+}
+
+# Mapa de moeda padrão por país (nome ou ISO2)
+DEFAULT_CURRENCY_BY_COUNTRY = {
+    "GERMANY": "EUR",
+    "DE": "EUR",
+    "SPAIN": "EUR",
+    "ES": "EUR",
+    "ITALY": "EUR",
+    "IT": "EUR",
+    "MONTENEGRO": "EUR",
+    "ME": "EUR",
+    "MEXICO": "MXN",
+    "MX": "MXN",
+    "UNITED STATES": "USD",
+    "USA": "USD",
+    "US": "USD",
+    "SWITZERLAND": "CHF",
+    "CH": "CHF",
+    "THAILAND": "THB",
+    "TH": "THB",
+    "AUSTRALIA": "AUD",
+    "AU": "AUD",
+}
+
+# -------------------- DATAS --------------------
+
 def is_valid_date_token(token: str) -> bool:
     token = token.strip()
     for fmt in DATE_PATTERNS:
@@ -151,6 +204,32 @@ def is_valid_date_token(token: str) -> bool:
         except ValueError:
             continue
     return False
+
+def extract_first_date_token(s: Optional[str]) -> Optional[str]:
+    """
+    Procura o primeiro token que parece data em uma string qualquer e retorna
+    só o token (ex.: 'Today: 04/Mar/2026' -> '04/Mar/2026').
+    """
+    if not s:
+        return None
+    for m in DATE_TOKEN_REGEX.finditer(s):
+        token = m.group(0)
+        if is_valid_date_token(token):
+            return token
+    return None
+
+def extract_two_dates_from_lines(full_text: str):
+    """
+    Versão global: procura TODOS os tokens de data no texto inteiro e retorna os dois primeiros.
+    Corrige o caso em que Today e Effective estão em linhas separadas.
+    """
+    tokens = DATE_TOKEN_REGEX.findall(full_text or "")
+    valids = [t for t in tokens if is_valid_date_token(t)]
+    if len(valids) >= 2:
+        return valids[0], valids[1]
+    if len(valids) == 1:
+        return valids[0], None
+    return None, None
 
 def contains_date_like(s: str) -> bool:
     if not s:
@@ -188,6 +267,21 @@ def strip_parenthesized_dates(s: Optional[str]) -> Optional[str]:
     s = re.sub(r"\([^()]*\d[^()]*\)", "", s)
     return s.strip() or None
 
+LEADING_JUNK_RE = re.compile(r"^[^0-9A-Za-z]+")
+
+def strip_leading_junk(s: Optional[str]) -> Optional[str]:
+    """
+    Remove qualquer caractere NÃO alfanumérico no início da string.
+    Ex.: "_ valeria@x.com" -> "valeria@x.com"
+         "| revenue@x.com" -> "revenue@x.com"
+         "— facturacion@x.com" -> "facturacion@x.com"
+    """
+    if s is None:
+        return None
+    s = str(s).lstrip()
+    s = LEADING_JUNK_RE.sub("", s)
+    return s
+
 def clean_extracted_value(s: Optional[str]) -> Optional[str]:
     if s is None:
         return None
@@ -196,6 +290,10 @@ def clean_extracted_value(s: Optional[str]) -> Optional[str]:
     v = strip_signature_prefix(v) or v
     v = strip_parenthesized_dates(v) or v
     v = re.sub(r"\s{2,}", " ", v).strip()
+
+    # Remove lixo no começo (|, _, —, bullets, etc.)
+    v = strip_leading_junk(v) or ""
+
     if not re.search(rf"[{UNICODE_LETTERS}0-9]", v):
         return None
     if contains_date_like(v):
@@ -254,15 +352,6 @@ def is_alpha_line(s: str) -> bool:
     if contains_date_like(s) or SIGNATURE_NOISE.match(s):
         return False
     return re.fullmatch(rf"[{UNICODE_LETTERS} .'\-()]{2,120}", s) is not None
-
-def extract_two_dates_from_lines(full_text: str):
-    for ln in full_text.splitlines():
-        tokens = DATE_TOKEN_REGEX.findall(ln)
-        if len(tokens) >= 2:
-            d1, d2 = tokens[0], tokens[1]
-            if is_valid_date_token(d1) and is_valid_date_token(d2):
-                return d1, d2
-    return None, None
 
 def try_same_line_block(text: str, label_regex: str) -> Optional[str]:
     pattern = re.compile(
@@ -440,19 +529,74 @@ def extract_trn_same_line(words: List[Dict], anchors: List[Dict]) -> Optional[st
             return val
     return None
 
+def is_garbage_text(text: str) -> bool:
+    """
+    Heurística simples para detectar texto embaralhado (/HJDO1DPH, ([SHGLD,' etc.).
+    Se não encontramos nenhuma keyword típica do formulário, tratamos como "lixo".
+    """
+    if not text:
+        return True
+    if len(text.strip()) < 40:
+        return True
+
+    lowered = text.lower()
+    keywords = [
+        "hotel collect payment information form",
+        "legal name",
+        "expedia id",
+        "country",
+        "currency",
+        "first name",
+        "last name",
+        "email address",
+        "preferred language",
+    ]
+    if any(kw in lowered for kw in keywords):
+        return False
+
+    return True
+
+def ocr_extract_full_text(pdf_path: Path) -> str:
+    """
+    Converte o PDF em imagens e usa OCR (pytesseract) para extrair o texto legível.
+    """
+    texts = []
+    images = convert_from_path(str(pdf_path), dpi=300, poppler_path=POPPLER_PATH)
+    for img in images:
+        try:
+            t = pytesseract.image_to_string(img, lang="eng")
+            if t:
+                texts.append(t)
+        except Exception:
+            continue
+    return "\n".join(texts)
+
 def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
     results = {f["col"]: None for f in FIELDS}
+
     with pdfplumber.open(str(pdf_path)) as pdf:
         full_text_pages = []
         pages_bundle = []
+
         for idx, page in enumerate(pdf.pages, start=1):
             words = words_from_page(page)
             text = page.extract_text() or ""
             full_text_pages.append(text)
             pages_bundle.append((idx, page, words, text))
 
-        full_text = normalize_block_text("\n".join(full_text_pages))
+        # Texto cru pelo pdfplumber
+        full_text_raw = normalize_block_text("\n".join(full_text_pages))
 
+        # Decide se cai no OCR
+        use_ocr = is_garbage_text(full_text_raw)
+        if use_ocr:
+            ocr_text = ocr_extract_full_text(pdf_path)
+            full_text = normalize_block_text(ocr_text)
+            pages_bundle = []  # sem extração posicional
+        else:
+            full_text = full_text_raw
+
+        # ---------- EXTRAÇÃO POSICIONAL (apenas se não for OCR) ----------
         for idx, page, words, text in pages_bundle:
             if not words:
                 continue
@@ -478,12 +622,12 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                     words, anchors_trn
                 )
 
+        # ---------- EXTRAÇÃO VIA TEXTO PLANO (vale para OCR também) ----------
         d1, d2 = extract_two_dates_from_lines(full_text)
-        if d1 and d2:
-            if not results["Today's date"]:
-                results["Today's date"] = d1
-            if not results["Effective Date of Change"]:
-                results["Effective Date of Change"] = d2
+        if d1 and not results["Today's date"]:
+            results["Today's date"] = d1
+        if d2 and not results["Effective Date of Change"]:
+            results["Effective Date of Change"] = d2
 
         if not results["Currency"]:
             m = re.search(r"(?is)\bcurrency\s*:\s*([A-Za-z]{3})\b", full_text)
@@ -526,8 +670,8 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
             results[col] = found
 
         if results["Currency"]:
-            cur = results["Currency"].upper().strip()
-            results["Currency"] = cur if re.fullmatch(r"[A-Z]{3}", cur) else None
+            cur0 = results["Currency"].upper().strip()
+            results["Currency"] = cur0 if re.fullmatch(r"[A-Z]{3}", cur0) else None
 
         full_text_safe = locals().get("full_text", "")
 
@@ -572,6 +716,46 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
             c_val = None
         results["Country"] = c_val or results.get("Country")
 
+        # ---------- NORMALIZAÇÃO FINAL DE DATAS E MOEDA ----------
+
+        # Datas: força que sejam tokens de data válidos
+        for date_col in ("Today's date", "Effective Date of Change"):
+            raw = results.get(date_col)
+            token = extract_first_date_token(raw)
+            results[date_col] = token
+
+        # Fallback: se só achou uma data no texto e Effective tá vazio, usa a mesma
+        if results.get("Today's date") and not results.get("Effective Date of Change"):
+            d1, d2 = extract_two_dates_from_lines(full_text)
+            if not d2 and d1 == results["Today's date"]:
+                # só uma data no formulário: usa a mesma nas duas
+                results["Effective Date of Change"] = d1
+
+        # Moeda: garante formato de 3 letras; remove lixo tipo COM
+        cur = results.get("Currency")
+        if isinstance(cur, str):
+            c = cur.strip().upper()
+            if not re.fullmatch(r"[A-Z]{3}", c):
+                m = re.search(r"\b([A-Z]{3})\b", c)
+                c = m.group(1).upper() if m else None
+            if c and c not in KNOWN_CURRENCIES:
+                c = None
+            results["Currency"] = c
+
+        # Se ainda não tem moeda (ou foi invalidada), tenta derivar pelo país
+        if not results.get("Currency"):
+            country_raw = (results.get("Country") or "").strip()
+            country_norm = country_raw.upper()
+            iso2 = None
+            if country_raw:
+                iso2 = to_iso2(country_raw)
+            cur_final = (
+                DEFAULT_CURRENCY_BY_COUNTRY.get(country_norm)
+                or (DEFAULT_CURRENCY_BY_COUNTRY.get(iso2.upper()) if iso2 else None)
+            )
+            results["Currency"] = cur_final
+
+        # ---------- TRANSLITERAÇÃO FINAL ----------
         translit_fields = {
             "First Name",
             "Last Name",
@@ -903,13 +1087,12 @@ def inject_into_webadi(
     if not out_path:
         out_path = template_path
 
-    # NÃO removemos imagens/ícones para manter a formatação o mais fiel possível
     wb.save(str(out_path))
     print(f"[OK] WEBADI preenchido: {out_path}")
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Extract HCPIF fields into Excel (R2.6 + WEBADI injection robusta)."
+        description="Extract HCPIF fields into Excel (R2.6 + WEBADI injection + OCR fallback)."
     )
     ap.add_argument("--input_dir", type=str, default=str(DEFAULT_INPUT_DIR))
     ap.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT_FILE))
@@ -993,6 +1176,7 @@ def main():
             data["file_path"] = str(pdf.resolve())
             rows.append(data)
         except Exception as e:
+            print(f"[ERROR] Falha ao processar {pdf.name}: {e}")
             rows.append(
                 {
                     "file_name": pdf.name,
@@ -1003,8 +1187,22 @@ def main():
 
     df = pd.DataFrame(rows)
     ordered_cols = [f["col"] for f in FIELDS]
+
+    # Garante que todas as colunas dos FIELDS existam (evita KeyError)
+    for col in ordered_cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+
     aux_cols = [c for c in df.columns if c not in ordered_cols]
     df = df[ordered_cols + aux_cols]
+
+    # Limpa lixo inicial em TODAS as células string do DataFrame
+    def _strip_cell(v):
+        if isinstance(v, str):
+            return strip_leading_junk(v)
+        return v
+
+    df = df.applymap(_strip_cell)
 
     try:
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
