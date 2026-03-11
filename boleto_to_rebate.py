@@ -28,7 +28,7 @@ ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle I
 
 # Credenciais Oracle
 USERNAME = "josenjr"
-PASSWORD = "eyX057UWzLnZTl3w"  # TROCAR: ideal ler de variável de ambiente
+PASSWORD = "INSERT PASSWORD"  # TROCAR: ideal ler de variável de ambiente
 DSN      = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
 
 # Pasta/arquivo de saída
