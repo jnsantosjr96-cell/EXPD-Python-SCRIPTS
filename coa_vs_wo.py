@@ -41,7 +41,7 @@ RELO_DM_TEMPLATE = Path(
 
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
 USERNAME = "josenjr"
-PASSWORD = "INSERT PASSWORD"      # CHANGE ME
+PASSWORD = "eyX057UWzLnZTl3w"      # CHANGE ME
 DSN      = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
 
 # WO adjustments query
@@ -298,7 +298,9 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
     col_total_amt  = "AP"  # Total Amt
 
     # Columns that must preserve default value from row 10 (includes AH)
-    preserve_letters = ["T", "V", "X", "AH", "AI", "AJ", "AK", "AQ", "AR", "AS"]
+    # Ajustado: removidas colunas T (Credit Reason) e V (skip workflow),
+    # para que fiquem em branco nas novas linhas.
+    preserve_letters = ["X", "AH", "AI", "AJ", "AK", "AQ", "AR", "AS"]
 
     # 4) Insert rows starting at row 11 (row 10 = template defaults)
     start_row = 11
@@ -327,7 +329,7 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
         # Reference: DM ISSUED TO OFFSET CM <Transaction Number>
         ws[f"{col_reference}{r}"] = f"DM ISSUED TO OFFSET CM {trx_number}"
 
-        # Copy default values from row 10 for specific columns (including AH -> keeps 'Line 1')
+        # Copy default values from row 10 for specific columns (no T/V)
         for colL in preserve_letters:
             _copy_default_from_row(ws, colL, 10, r)
 
