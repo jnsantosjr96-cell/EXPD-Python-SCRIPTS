@@ -53,7 +53,7 @@ TESSDATA_PREFIX = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\
 # -------------------- ORACLE CONFIG --------------------
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
 ORACLE_USERNAME = "josenjr"
-ORACLE_PASSWORD = "eyX057UWzLnZTl3w"  # TROCAR pela senha real localmente
+ORACLE_PASSWORD = "INSERT PASSWORD"  # TROCAR pela senha real localmente
 ORACLE_DSN = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
 
 # Query Oracle TCA (com placeholder para lista dinâmica de Expedia IDs)
