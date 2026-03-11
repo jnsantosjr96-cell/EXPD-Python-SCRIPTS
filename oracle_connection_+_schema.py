@@ -9,7 +9,7 @@ oracledb.init_oracle_client(
 
 # 2) Credenciais e DSN
 USERNAME = "josenjr"
-PASSWORD = "eyX057UWzLnZTl3w"  # ideal é depois colocar em variável de ambiente
+PASSWORD = "INSERT PASSWORD"  # ideal é depois colocar em variável de ambiente
 DSN      = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
 
 # 3) Caminho de saída
