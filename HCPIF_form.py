@@ -1,19 +1,35 @@
+
 # -*- coding: utf-8 -*-
 """
 HCPIF extractor R2.6 + OCR fallback
-
 - Base: R2.4 (robust, Unicode-safe, anti-signature & anti-date, smart transliteration)
 - R2.5: Integração com WEBADI preservando macros/estrutura; mantém "Preferred Language" e "BATCH_NAME".
 - R2.6:
-  * Desprotege workbook e todas as abas antes de escrever (opcional via CLI).
-  * Detecção de cabeçalho robusta (normalização, sinônimos, tolerante a "HOTEL ID", NBSP, quebras de linha).
-  * Busca de cabeçalho a partir da linha 5 (parametrizável).
-  * CLI para nome da aba, linha inicial do cabeçalho e debug.
-
+* Desprotege workbook e todas as abas antes de escrever (opcional via CLI).
+* Detecção de cabeçalho robusta (normalização, sinônimos, tolerante a "HOTEL ID", NBSP, quebras de linha).
+* Busca de cabeçalho a partir da linha 5 (parametrizável).
+* CLI para nome da aba, linha inicial do cabeçalho e debug.
 Extras:
 - OCR fallback via Tesseract + pdf2image para PDFs com texto embaralhado.
-- Limpeza de caracteres lixo no início dos campos (datas, currency, e‑mails etc.).
+- Limpeza de caracteres lixo no início dos campos (datas, currency, emails etc.).
 - Normalização de Today's date, Effective Date of Change e Currency, com fallbacks.
+
+R2.7 (este arquivo):
+- Conexão Oracle (TCA) por Expedia ID (ATTRIBUTE1) com lista dinâmica no IN.
+- Match HCPIF x Oracle por Expedia ID + país (ISO2).
+- Novas colunas no HCPIF Extraction:
+    * Country ISO2 (logo após Country)
+    * Found SLE OID (ORACLE_ID da query)
+    * Found SLE Name (SLE_NAME da query)
+    * Oracle Currency
+    * Currency Matches Oracle (YES/NO)
+    * Comments ("Updated Ownership per HCPIF - <file_name>")
+- Força preenchimento de Hotel Name (usando HOTEL_NAME Oracle se vier vazio da extração).
+- Remove caracteres especiais de Legal Name (mantém apenas letras, números e espaço) no Output e WEBADI.
+- WEBADI: CUSTOMER_NAME agora vem de Hotel Name (e não de Legal Name / SLE Name).
+- Linhas com RECEIPT_METHOD_NAME contendo 'DIRECT DEBIT' ou TAI_BM contendo 'GROUP'
+  são removidas do output principal/WebADI e colocadas em aba separada.
+- As colunas adicionais vindas da query Oracle ficam em aba separada "Oracle_Details".
 """
 
 # -------------------- DEFAULT PATHS --------------------
@@ -26,12 +42,136 @@ DEFAULT_OUTPUT_FILE = r"C:\Users\josenjr\Downloads\HCPIFs\Output\HCPIF_extractio
 DEFAULT_WEBADI_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OC WebADI SF 149540900 2-13-26 (002).xlsm"
 
 # -------------------- POPPLER / TESSERACT CONFIG --------------------
+
 # Poppler (onde está pdfinfo.exe)
 POPPLER_PATH = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Poppler\poppler-25.12.0\Library\bin"
 
 # Tesseract (executável) + tessdata (eng.traineddata)
 TESSERACT_EXE = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\tesseract.exe"
 TESSDATA_PREFIX = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\tessdata"
+
+# -------------------- ORACLE CONFIG --------------------
+ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
+ORACLE_USERNAME = "josenjr"
+ORACLE_PASSWORD = "eyX057UWzLnZTl3w"  # TROCAR pela senha real localmente
+ORACLE_DSN = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
+
+# Query Oracle TCA (com placeholder para lista dinâmica de Expedia IDs)
+ORACLE_TCA_SQL_TEMPLATE = """
+SELECT
+    HCA.ACCOUNT_NUMBER AS ORACLE_ID,
+    COUNT(HCA.ACCOUNT_NUMBER) OVER (PARTITION BY HCA.ACCOUNT_NUMBER) AS DUPLICATE_COUNT,
+    HZP.PARTY_NUMBER,
+    HCA.ATTRIBUTE1 AS EXPEDIA_ID,
+    HZP.PARTY_NAME AS HOTEL_NAME,
+    TAI.Attribute1 AS TAI_PC,
+    TAI.Business_Model AS TAI_BM,
+    SITEOU.NAME AS SITE_OU,
+    HCA.CUSTOMER_CLASS_CODE,
+    HCA.ATTRIBUTE3 AS SOURCE_SYSTEM,
+    HCA.CREATION_DATE AS ACCOUNT_CREATION_DATE,
+    SLE.PARTY_NAME AS SLE_NAME,
+    SLE.SLE_OID,
+    REL.START_DATE AS RELATIONSHIP_DATE,
+    HZP.ADDRESS1,
+    HZP.CITY,
+    HZP.POSTAL_CODE,
+    HZP.STATE,
+    HZP.PROVINCE,
+    HZP.COUNTRY AS COUNTRY_ABBR,
+    TER.TERRITORY_SHORT_NAME AS COUNTRY_FULL_NAME,
+    CONTACT.USER_NAME AS LAST_UPDATED_BY,
+    CONTACT.FIRST_NAME,
+    CONTACT.LAST_NAME,
+    CONTACT.EMAIL_ADDRESS,
+    CONTACT.PRIMARY_FLAG AS CONTACT_PRIMARY_FLAG,
+    TAX.REGISTRATION_NUMBER,
+    TAX.TAX,
+    TAX.TAX_REGIME_CODE,
+    TAX.REGISTRATION_STATUS_CODE,
+    TAX.EFFECTIVE_FROM AS TAX_START_DATE,
+    CURR.CURRENCY_CODE AS ORACLE_CURRENCY,
+    RM.NAME AS RECEIPT_METHOD_NAME,
+    RM.CURRENT_RM,
+    RM.RM_START_DATE
+FROM AR.HZ_CUST_ACCOUNTS HCA
+
+LEFT JOIN AR.HZ_PARTIES HZP
+    ON HZP.PARTY_ID = HCA.PARTY_ID
+
+-- ACTIVE HCC PARENT INFO
+LEFT JOIN 
+    (SELECT HR.OBJECT_ID,HR.SUBJECT_ID,HR.RELATIONSHIP_CODE,HR.START_DATE
+        FROM AR.HZ_RELATIONSHIPS HR
+            WHERE HR.RELATIONSHIP_CODE = 'LEGAL ENTITY/OWNER OF'
+                AND HR.END_DATE LIKE '31-DEC-12') REL
+                    ON REL.OBJECT_ID = HCA.PARTY_ID
+
+-- SLE INFO
+LEFT JOIN
+    (SELECT HZP2.PARTY_NAME,HZP2.PARTY_ID,HCA2.ACCOUNT_NUMBER AS SLE_OID
+        FROM AR.HZ_PARTIES HZP2
+            LEFT JOIN AR.HZ_CUST_ACCOUNTS HCA2
+                ON HCA2.PARTY_ID = HZP2.PARTY_ID) SLE
+                    ON SLE.PARTY_ID = REL.SUBJECT_ID
+
+-- ACTIVE TAX REGISTRATION INFO
+LEFT JOIN 
+    (SELECT PTP.PARTY_ID,ZR.REGISTRATION_NUMBER,ZR.REGISTRATION_STATUS_CODE,ZR.EFFECTIVE_FROM,ZR.EFFECTIVE_TO,ZR.TAX_REGIME_CODE,ZR.TAX
+        FROM APPS.ZX_PARTY_TAX_PROFILE PTP
+            LEFT JOIN APPS.ZX_REGISTRATIONS ZR
+                ON PTP.PARTY_TAX_PROFILE_ID = ZR.PARTY_TAX_PROFILE_ID
+                    WHERE ZR.REGISTRATION_NUMBER IS NOT NULL
+                        AND ZR.EFFECTIVE_TO IS NULL) TAX
+                            ON TAX.PARTY_ID = HCA.PARTY_ID
+
+-- CURRENCY INFO
+LEFT JOIN
+    (SELECT HCPA.CURRENCY_CODE,HCPA.CUST_ACCOUNT_ID
+        FROM AR.HZ_CUST_PROFILE_AMTS HCPA
+            WHERE HCPA.ATTRIBUTE1 IS NULL) CURR
+                ON CURR.CUST_ACCOUNT_ID = HCA.CUST_ACCOUNT_ID
+
+-- CURRENT RM INFO
+LEFT JOIN
+    (SELECT CRM.CUSTOMER_ID,CRM.ATTRIBUTE1 AS CURRENT_RM,CRM.START_DATE AS RM_START_DATE,ARM.NAME
+        FROM AR.RA_CUST_RECEIPT_METHODS CRM
+            LEFT JOIN AR.AR_RECEIPT_METHODS ARM
+                ON CRM.RECEIPT_METHOD_ID = ARM.RECEIPT_METHOD_ID
+                    WHERE CRM.PRIMARY_FLAG = 'Y'
+                        AND CRM.END_DATE IS NULL) RM
+                            ON RM.CUSTOMER_ID = HCA.CUST_ACCOUNT_ID
+
+-- ACTIVE CONTACT INFO
+LEFT JOIN
+    (SELECT ACV.CUSTOMER_ID,ACV.FIRST_NAME,ACV.LAST_NAME,ACV.EMAIL_ADDRESS,CRV.PRIMARY_FLAG,FNDU.USER_NAME
+        FROM APPS.AR_CONTACTS_V ACV
+            LEFT JOIN APPS.AR_CONTACT_ROLES_V CRV
+                ON ACV.CONTACT_ID = CRV.CONTACT_ID
+                    LEFT JOIN APPS.FND_USER FNDU
+                        ON FNDU.USER_ID = ACV.LAST_UPDATED_BY
+                    WHERE STATUS = 'A'
+                        AND CRV.PRIMARY_FLAG = 'Y') CONTACT
+                            ON CONTACT.CUSTOMER_ID = HCA.CUST_ACCOUNT_ID
+
+-- FULL COUNTRY NAME
+LEFT JOIN
+    (SELECT TERRITORY_CODE,TERRITORY_SHORT_NAME
+        FROM APPLSYS.FND_TERRITORIES_TL) TER
+            ON TER.TERRITORY_CODE = HZP.COUNTRY
+
+LEFT JOIN XXEXPD.XXEXPD_TCA_ADDITIONAL_INFO TAI
+    ON HCA.Cust_Account_ID = TAI.partner_id
+
+LEFT JOIN HZ_PARTY_SITES PS
+    ON HZP.party_id = PS.party_id
+
+LEFT JOIN HR_OPERATING_UNITS SITEOU  
+    ON HCA.ORG_ID = SITEOU.ORGANIZATION_ID
+
+WHERE HCA.CUSTOMER_CLASS_CODE = 'HOTEL'
+  AND HCA.Attribute1 IN ({expedia_ids})
+"""
 
 # -------------------- ENSURE / INSTALL DEPS --------------------
 import sys
@@ -41,8 +181,11 @@ import argparse
 import copy
 import re
 import os
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+
+import oracledb  # Oracle client
 
 REQUIRED = [
     ("pdfplumber", "pdfplumber"),
@@ -70,6 +213,7 @@ tqdm = ensure_package("tqdm", "tqdm")
 unidecode_mod = ensure_package("Unidecode", "unidecode")
 pytesseract = ensure_package("pytesseract", "pytesseract")
 pdf2image = ensure_package("pdf2image", "pdf2image")
+
 from unidecode import unidecode  # noqa: E402
 from pdf2image import convert_from_path  # noqa: E402
 
@@ -90,14 +234,14 @@ for _ext in (".jpg", ".jpeg", ".JPG", ".JPEG"):
         _ox_manifest.mimetypes.add_type("image/jpeg", _ext)
     except Exception:
         pass
-# --- fim do hotfix ---
 
+# --- fim do hotfix ---
 from openpyxl import load_workbook  # noqa: E402
 from openpyxl.utils import column_index_from_string  # noqa: E402
 
 # -------------------- FIELD DEFINITIONS --------------------
 FIELDS: List[Dict] = [
-    {"col": "Today's date", "labels": [r"today[\']s\s*date"]},
+    {"col": "Today's date", "labels": [r"today[\\']s\s*date"]},
     {"col": "Effective Date of Change", "labels": [r"effective\s*date\s*of\s*change"]},
     {"col": "Expedia ID", "labels": [r"expedia\s*id"]},
     {"col": "Country", "labels": [r"country"]},
@@ -126,6 +270,7 @@ FIELDS: List[Dict] = [
 
 SAME_LINE_PATTERN_TMPL = r"(?im)^\s*{label}\s*:?\s*(?P<val>[^\n\r]+?)\s*$"
 LABEL_ONLY_PATTERN_TMPL = r"(?im)^\s*{label}\s*:?\s*$"
+
 EMAIL_FALLBACK = re.compile(r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}")
 
 DATE_PATTERNS = [
@@ -136,21 +281,27 @@ DATE_PATTERNS = [
     "%d-%b-%Y",
     "%d-%m-%Y",
 ]
+
 DATE_TOKEN_REGEX = re.compile(
     r"\b(\d{1,2}/[A-Za-z]{3}/\d{4}|\d{1,2}/\d{1,2}/\d{4}|"
     r"\d{4}-\d{2}-\d{2}|\d{1,2}-[A-Za-z]{3}-\d{4}|\d{1,2}-\d{1,2}-\d{4})\b"
 )
+
 MONTH3 = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
 
 UNICODE_LETTERS = r"A-Za-z-\u0370-\u03FF\u1F00-\u1FFF\u3040-\u30FF\u4E00-\u9FFF"
+
 SIGNATURE_NOISE = re.compile(r"(?i)^\s*(signature|signed|signee|signer)\b")
+
 HEADER_NOISE = re.compile(
     r"(?i)\b(city|state|province|billing|contact|information|signature|signed|signee|signer)\b"
 )
+
 POSTAL_LIKE = re.compile(r"(?i)^([A-Z]?\d[\dA-Z\- ]{2,}|[A-Z]\d[A-Z]\s*\d[A-Z]\d)$")
 
 ALL_LABELS = [lab for f in FIELDS for lab in f["labels"]]
 BARRIER_LABELS = ALL_LABELS + [r"signature", r"signed", r"signee", r"signer"]
+
 NEXT_LABEL_BARRIER = re.compile(r"(?i)\b(?:" + "|".join(BARRIER_LABELS) + r")\b\s*:?")
 LABEL_LINE_RE = re.compile(r"(?im)^\s*(?:" + "|".join(BARRIER_LABELS) + r")\s*:?\b")
 
@@ -194,7 +345,6 @@ DEFAULT_CURRENCY_BY_COUNTRY = {
 }
 
 # -------------------- DATAS --------------------
-
 def is_valid_date_token(token: str) -> bool:
     token = token.strip()
     for fmt in DATE_PATTERNS:
@@ -274,7 +424,7 @@ def strip_leading_junk(s: Optional[str]) -> Optional[str]:
     Remove qualquer caractere NÃO alfanumérico no início da string.
     Ex.: "_ valeria@x.com" -> "valeria@x.com"
          "| revenue@x.com" -> "revenue@x.com"
-         "— facturacion@x.com" -> "facturacion@x.com"
+         "• facturacion@x.com" -> "facturacion@x.com"
     """
     if s is None:
         return None
@@ -290,10 +440,8 @@ def clean_extracted_value(s: Optional[str]) -> Optional[str]:
     v = strip_signature_prefix(v) or v
     v = strip_parenthesized_dates(v) or v
     v = re.sub(r"\s{2,}", " ", v).strip()
-
-    # Remove lixo no começo (|, _, —, bullets, etc.)
+    # Remove lixo no começo (|, _, •, bullets, etc.)
     v = strip_leading_junk(v) or ""
-
     if not re.search(rf"[{UNICODE_LETTERS}0-9]", v):
         return None
     if contains_date_like(v):
@@ -376,7 +524,6 @@ def try_next_line_block(
     if not m:
         return None
     tail = text[m.end() :]
-
     start_of_label = re.compile(
         r"(?im)^\s*(?:" + "|".join(all_label_variants) + r")\s*:\b"
     )
@@ -386,7 +533,9 @@ def try_next_line_block(
             continue
         if start_of_label.match(cand):
             return None
-        if HEADER_NOISE.search(cand) or SIGNATURE_NOISE.match(cand) or contains_date_like(cand):
+        if HEADER_NOISE.search(cand) or SIGNATURE_NOISE.match(cand) or contains_date_like(
+            cand
+        ):
             continue
         return cand
     return None
@@ -538,7 +687,6 @@ def is_garbage_text(text: str) -> bool:
         return True
     if len(text.strip()) < 40:
         return True
-
     lowered = text.lower()
     keywords = [
         "hotel collect payment information form",
@@ -553,7 +701,6 @@ def is_garbage_text(text: str) -> bool:
     ]
     if any(kw in lowered for kw in keywords):
         return False
-
     return True
 
 def ocr_extract_full_text(pdf_path: Path) -> str:
@@ -573,11 +720,9 @@ def ocr_extract_full_text(pdf_path: Path) -> str:
 
 def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
     results = {f["col"]: None for f in FIELDS}
-
     with pdfplumber.open(str(pdf_path)) as pdf:
         full_text_pages = []
         pages_bundle = []
-
         for idx, page in enumerate(pdf.pages, start=1):
             words = words_from_page(page)
             text = page.extract_text() or ""
@@ -609,14 +754,18 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
 
             if not results["Currency"]:
                 results["Currency"] = extract_currency_positional(words, anchors_currency)
+
             if not results["Effective Date of Change"]:
                 results["Effective Date of Change"] = extract_date_positional(
                     words, anchors_edc
                 )
+
             if not results["Today's date"]:
                 results["Today's date"] = extract_date_positional(words, anchors_today)
+
             if not results["Country"]:
                 results["Country"] = extract_country_positional(words, anchors_country)
+
             if not results["Tax Registration Number"]:
                 results["Tax Registration Number"] = extract_trn_same_line(
                     words, anchors_trn
@@ -658,11 +807,11 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                     found = try_same_line_block(full_text, lab)
                     if found:
                         break
-                if not found:
-                    for lab in f["labels"]:
-                        found = try_next_line_block(full_text, lab, BARRIER_LABELS)
-                        if found:
-                            break
+            if not found:
+                for lab in f["labels"]:
+                    found = try_next_line_block(full_text, lab, BARRIER_LABELS)
+                    if found:
+                        break
             if not found and col.lower().startswith("email"):
                 m = EMAIL_FALLBACK.search(full_text)
                 if m:
@@ -674,7 +823,6 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
             results["Currency"] = cur0 if re.fullmatch(r"[A-Z]{3}", cur0) else None
 
         full_text_safe = locals().get("full_text", "")
-
         results["State/Province"], results["Postal Code"] = sanitize_state_and_postal(
             results.get("State/Province"), results.get("Postal Code")
         )
@@ -717,7 +865,6 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
         results["Country"] = c_val or results.get("Country")
 
         # ---------- NORMALIZAÇÃO FINAL DE DATAS E MOEDA ----------
-
         # Datas: força que sejam tokens de data válidos
         for date_col in ("Today's date", "Effective Date of Change"):
             raw = results.get(date_col)
@@ -772,7 +919,7 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
             if results.get(col):
                 results[col] = unidecode(results[col]).strip()
 
-    return results
+        return results
 
 def find_pdfs(input_dir: Path) -> List[Path]:
     return sorted([p for p in input_dir.rglob("*.pdf") if p.is_file()])
@@ -861,22 +1008,18 @@ def find_header_row(
     debug: bool = False,
 ) -> Tuple[int, Dict[str, int]]:
     must_have = {_apply_synonym(_norm_header_key(x)) for x in must_have_cols}
-
     if debug:
         _debug_dump_first_rows(ws, n=max(6, start_at_row + 2))
         print(
             f"[DEBUG] Procurando cabeçalho a partir da linha {start_at_row} "
             f"(must_have={sorted(list(must_have))})"
         )
-
     for r in range(max(1, start_at_row), ws.max_row + 1):
         header_map_norm: Dict[str, int] = {}
-
         for c in range(1, ws.max_column + 1):
             val = ws.cell(r, c).value
             if not isinstance(val, str):
                 continue
-
             raw = (
                 val.replace("\u00A0", " ")
                 .replace("\n", " ")
@@ -885,11 +1028,9 @@ def find_header_row(
             )
             if not raw:
                 continue
-
             key = _apply_synonym(_norm_header_key(raw))
             if key and key not in header_map_norm:
                 header_map_norm[key] = c
-
         if must_have.issubset(header_map_norm.keys()):
             if debug:
                 print(
@@ -898,9 +1039,9 @@ def find_header_row(
                 )
                 _debug_dump_row(ws, r)
             return r, header_map_norm
-
     raise RuntimeError(
-        "Não encontrei a linha de cabeçalho na aba WebADI. Verifique o template."
+        "Não encontrei a linha de cabeçalho na aba WebADI. "
+        "Verifique o template."
     )
 
 def last_data_row(ws, header_row: int, key_col_index: int) -> int:
@@ -977,7 +1118,6 @@ def inject_into_webadi(
 
     if sheet_name not in wb.sheetnames:
         raise RuntimeError(f"Aba '{sheet_name}' não encontrada no template.")
-
     ws = wb[sheet_name]
 
     # Atualiza a célula E3 (valor do BATCH_NAME) para "OC MMDDYYYY"
@@ -996,9 +1136,10 @@ def inject_into_webadi(
         ws, start_at_row=header_start_row, debug=debug
     )
 
+    # Mapeamento WebADI -> colunas do df
     wanted = {
         "HOTEL_ID": "Expedia ID",
-        "CUSTOMER_NAME": "Legal Name",
+        "CUSTOMER_NAME": "Hotel Name",  # agora vem do Hotel Name
         "ADDRESS_LINE_1": "Address Line 1",
         "CITY": "City",
         "POSTAL_CODE": "Postal Code",
@@ -1012,8 +1153,8 @@ def inject_into_webadi(
 
     col_state = header_map.get("STATE")
     col_province = header_map.get("PROVINCE")
-
     col_bill_to = header_map.get("BILL_TO")
+
     if not col_bill_to:
         col_bill_to = column_index_from_string("Q")
         if debug:
@@ -1047,7 +1188,6 @@ def inject_into_webadi(
             )
 
     current = base_row
-
     for _, rec in df.iterrows():
         iso2 = to_iso2(rec.get("Country"))
         stateprov = rec.get("State/Province")
@@ -1066,7 +1206,6 @@ def inject_into_webadi(
             if not col_idx:
                 continue
             val = rec.get(script_col)
-
             if webadi_col == "COUNTRY":
                 v2 = to_iso2(val) or val
                 if v2 not in (None, "", " "):
@@ -1074,6 +1213,9 @@ def inject_into_webadi(
             elif webadi_col == "BILLING_CURRENCY":
                 if isinstance(val, str) and re.fullmatch(r"[A-Za-z]{3}", val.strip()):
                     ws.cell(current, col_idx).value = val.strip().upper()
+                else:
+                    if val not in (None, "", " "):
+                        ws.cell(current, col_idx).value = val
             else:
                 if val not in (None, "", " "):
                     ws.cell(current, col_idx).value = val
@@ -1090,9 +1232,209 @@ def inject_into_webadi(
     wb.save(str(out_path))
     print(f"[OK] WEBADI preenchido: {out_path}")
 
+# -------------------- ORACLE ENRICH / HELPER FUNCS --------------------
+
+LEGAL_NAME_CLEAN_RE = re.compile(r"[^A-Za-z0-9 ]+")
+
+def add_country_iso2_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Adiciona coluna Country ISO2 logo após 'Country'."""
+    if "Country" not in df.columns:
+        return df
+    iso2_values = [to_iso2(v) for v in df["Country"]]
+    insert_pos = list(df.columns).index("Country") + 1
+    df.insert(loc=insert_pos, column="Country ISO2", value=iso2_values)
+    return df
+
+def sanitize_legal_name_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove caracteres especiais de Legal Name (mantém letras, números e espaço)."""
+    if "Legal Name" not in df.columns:
+        return df
+
+    def _clean_ln(x):
+        if x in (None, "", " "):
+            return x
+        x = unidecode(str(x))
+        x = LEGAL_NAME_CLEAN_RE.sub("", x)
+        return x.strip()
+
+    df["Legal Name"] = df["Legal Name"].astype(str).apply(_clean_ln)
+    return df
+
+def fetch_oracle_tca(expedia_ids: List[str]) -> pd.DataFrame:
+    """
+    Busca dados TCA no Oracle para a lista de Expedia ID (ATTRIBUTE1),
+    usando a query grande passada.
+    """
+    expedia_ids = sorted({str(x).strip() for x in expedia_ids if pd.notna(x) and str(x).strip()})
+    if not expedia_ids:
+        return pd.DataFrame()
+
+    ids_literal = ", ".join(f"'{eid}'" for eid in expedia_ids)
+    sql = ORACLE_TCA_SQL_TEMPLATE.format(expedia_ids=ids_literal)
+
+    print(f"\n[INFO] Rodando query Oracle para {len(expedia_ids)} Expedia ID(s)...")
+
+    oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
+
+    with oracledb.connect(user=ORACLE_USERNAME, password=ORACLE_PASSWORD, dsn=ORACLE_DSN) as con:
+        with con.cursor() as cur:
+            cur.execute("ALTER SESSION SET CURRENT_SCHEMA = APPS")
+
+        t0 = time.time()
+        with con.cursor() as cur:
+            cur.execute(sql)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+        elapsed = time.time() - t0
+
+    print(f"[INFO] Oracle query concluída. Linhas: {len(rows)}. Tempo: {elapsed:.2f}s")
+
+    df_oracle = pd.DataFrame(rows, columns=cols)
+
+    if not df_oracle.empty:
+        df_oracle["EXPEDIA_ID"] = df_oracle["EXPEDIA_ID"].astype(str).str.strip()
+        df_oracle["COUNTRY_ABBR"] = df_oracle["COUNTRY_ABBR"].astype(str).str.strip()
+        df_oracle = df_oracle.sort_values(
+            ["EXPEDIA_ID", "COUNTRY_ABBR", "DUPLICATE_COUNT"],
+            ascending=[True, True, True],
+        )
+        df_oracle = df_oracle.drop_duplicates(subset=["EXPEDIA_ID", "COUNTRY_ABBR"], keep="first")
+
+    return df_oracle
+
+def enrich_hcpif_with_oracle(
+    df: pd.DataFrame, base_columns: List[str]
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Enriquece o HCPIF_extraction com:
+      - Found SLE OID (ORACLE_ID)
+      - Found SLE Name (SLE_NAME)
+      - Oracle Currency + flag se bate com a Currency extraída
+      - Preenche Hotel Name faltando com HOTEL_NAME Oracle
+      - Comentários "Updated Ownership per HCPIF - <file_name>"
+      - Se RECEIPT_METHOD_NAME contiver DIRECT DEBIT ou TAI_BM contiver GROUP,
+        remove do df principal e manda para df_excluded.
+      - df_oracle_details: todas as colunas extras vindas da query Oracle numa aba separada.
+
+    Retorna (df_principal_limpo, df_excluidos_limpo, df_oracle_details).
+    """
+    if "Expedia ID" not in df.columns:
+        print("[WARN] Coluna 'Expedia ID' não encontrada; skip Oracle enrichment.")
+        return df, pd.DataFrame(), pd.DataFrame()
+
+    expedia_ids = df["Expedia ID"].tolist()
+    df_oracle = fetch_oracle_tca(expedia_ids)
+    if df_oracle.empty:
+        print("[INFO] Nenhum dado Oracle retornado; HCPIF segue sem enrich.")
+        return df, pd.DataFrame(), pd.DataFrame()
+
+    df["Expedia ID"] = df["Expedia ID"].astype(str).str.strip()
+    if "Country ISO2" not in df.columns:
+        df["Country ISO2"] = df["Country"].map(lambda x: to_iso2(x) or "")
+
+    df_oracle["EXPEDIA_ID"] = df_oracle["EXPEDIA_ID"].astype(str).str.strip()
+    df_oracle["COUNTRY_ABBR"] = df_oracle["COUNTRY_ABBR"].astype(str).str.strip()
+
+    merged = df.merge(
+        df_oracle,
+        how="left",
+        left_on=["Expedia ID", "Country ISO2"],
+        right_on=["EXPEDIA_ID", "COUNTRY_ABBR"],
+        suffixes=("", "_ORACLE"),
+    )
+
+    # Found SLE OID e SLE Name
+    merged["Found SLE OID"] = merged["ORACLE_ID"]
+    merged["Found SLE Name"] = merged["SLE_NAME"]
+
+    # Garantir Hotel Name (força trazer a coluna)
+    if "Hotel Name" in merged.columns:
+        merged["Hotel Name"] = merged["Hotel Name"].where(
+            merged["Hotel Name"].notna()
+            & (merged["Hotel Name"].astype(str).str.strip() != ""),
+            merged["HOTEL_NAME"],
+        )
+    else:
+        merged["Hotel Name"] = merged["HOTEL_NAME"]
+
+    # Oracle Currency + match
+    merged["Oracle Currency"] = merged["ORACLE_CURRENCY"]
+    if "Currency" in merged.columns:
+        merged["Currency"] = merged["Currency"].astype(str).str.upper().str.strip()
+        merged["Oracle Currency"] = merged["Oracle Currency"].astype(str).str.upper().str.strip()
+
+        def _match(cur, oc):
+            if not cur or not oc:
+                return "NO"
+            return "YES" if cur == oc else "NO"
+
+        merged["Currency Matches Oracle"] = [
+            _match(c, o) for c, o in zip(merged["Currency"], merged["Oracle Currency"])
+        ]
+    else:
+        merged["Currency Matches Oracle"] = pd.NA
+
+    # Comentários
+    comment_col = "Comments"
+    new_comment = merged.get("file_name", pd.Series([""] * len(merged))).apply(
+        lambda fn: f"Updated Ownership per HCPIF - {fn}"
+    )
+    if comment_col in merged.columns:
+        merged[comment_col] = merged[comment_col].fillna("").astype(str)
+        merged[comment_col] = merged[comment_col].where(
+            merged[comment_col].str.strip() != "",
+            new_comment,
+        )
+    else:
+        merged[comment_col] = new_comment
+
+    # Oracle_Details: todas as colunas extras da query em aba separada
+    oracle_key_cols = [c for c in ["Expedia ID", "Country ISO2", "file_name", "file_path"] if c in merged.columns]
+    exclude_for_details = set(base_columns) | {
+        "Found SLE OID",
+        "Found SLE Name",
+        "Oracle Currency",
+        "Currency Matches Oracle",
+        "Comments",
+    }
+    oracle_value_cols = [c for c in merged.columns if c not in exclude_for_details]
+    mask_has_oracle = merged["ORACLE_ID"].notna() if "ORACLE_ID" in merged.columns else merged["Found SLE OID"].notna()
+    df_oracle_details = merged.loc[mask_has_oracle, oracle_key_cols + oracle_value_cols].copy()
+
+    # Filtro DIRECT DEBIT / TAI BM GROUP para aba Excluded
+    series_rm = merged.get("RECEIPT_METHOD_NAME", pd.Series([""] * len(merged))).astype(str)
+    mask_direct_debit = series_rm.str.contains("DIRECT DEBIT", case=False, na=False)
+
+    series_tai = merged.get("TAI_BM", pd.Series([""] * len(merged))).astype(str)
+    mask_tai_group = series_tai.str.contains("GROUP", case=False, na=False)
+
+    mask_excluded = mask_direct_debit | mask_tai_group
+
+    df_excluded_raw = merged[mask_excluded].copy()
+    df_main_raw = merged[~mask_excluded].copy()
+
+    if not df_excluded_raw.empty:
+        print(
+            f"[INFO] {len(df_excluded_raw)} linha(s) removida(s) do output principal por "
+            "RECEIPT_METHOD_NAME DIRECT DEBIT e/ou TAI_BM GROUP."
+        )
+
+    # Colunas finais permitidas nas abas principais (Extraction / Excluded)
+    extra_cols = ["Found SLE OID", "Found SLE Name", "Oracle Currency", "Currency Matches Oracle", "Comments"]
+    final_main_cols = list(base_columns)
+    for col in extra_cols:
+        if col in df_main_raw.columns and col not in final_main_cols:
+            final_main_cols.append(col)
+
+    df_main = df_main_raw.loc[:, final_main_cols].copy()
+    df_excluded = df_excluded_raw.loc[:, final_main_cols].copy()
+
+    return df_main, df_excluded, df_oracle_details
+
+# -------------------- MAIN --------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Extract HCPIF fields into Excel (R2.6 + WEBADI injection + OCR fallback)."
+        description="Extract HCPIF fields into Excel (R2.6 + WEBADI injection + OCR fallback + Oracle enrich)."
     )
     ap.add_argument("--input_dir", type=str, default=str(DEFAULT_INPUT_DIR))
     ap.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT_FILE))
@@ -1106,7 +1448,8 @@ def main():
         "--webadi_output",
         type=str,
         default=None,
-        help="Caminho p/ salvar cópia preenchida. Se omitido, gera 'OC WEBADI MMDDYYYY.xlsm' na mesma pasta do template.",
+        help="Caminho p/ salvar cópia preenchida. "
+        "Se omitido, gera 'OC WEBADI MMDDYYYY.xlsm' na mesma pasta do template.",
     )
     ap.add_argument(
         "--webadi_mode",
@@ -1144,6 +1487,7 @@ def main():
         action="store_false",
         help="Não desproteger workbook/abas antes de escrever.",
     )
+
     ap.set_defaults(webadi_unprotect=True)
 
     args = ap.parse_args()
@@ -1168,6 +1512,7 @@ def main():
         sys.exit(2)
 
     rows = []
+
     print(f"\nReading {len(pdf_files)} PDF(s) from: {input_dir}\n")
     for pdf in tqdm.tqdm(pdf_files, desc="Processing PDFs"):
         try:
@@ -1186,8 +1531,8 @@ def main():
             )
 
     df = pd.DataFrame(rows)
-    ordered_cols = [f["col"] for f in FIELDS]
 
+    ordered_cols = [f["col"] for f in FIELDS]
     # Garante que todas as colunas dos FIELDS existam (evita KeyError)
     for col in ordered_cols:
         if col not in df.columns:
@@ -1204,9 +1549,33 @@ def main():
 
     df = df.applymap(_strip_cell)
 
+    # Adiciona coluna Country ISO2 logo após Country
+    df = add_country_iso2_column(df)
+
+    # Base de colunas que DEVEM permanecer nas abas principais
+    base_columns = list(df.columns)
+
+    # Enriquecimento com Oracle (roda para TODOS os Expedia ID extraídos)
+    df, df_excluded, df_oracle_details = enrich_hcpif_with_oracle(df, base_columns)
+
+    # Sanitiza Legal Name (para Output e WEBADI)
+    df = sanitize_legal_name_column(df)
+    if not df_excluded.empty:
+        df_excluded = sanitize_legal_name_column(df_excluded)
+
+    # Grava Excel com abas: Extraction, Excluded_DIRECTDEBIT_TAIBM, Oracle_Details
     try:
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="Extraction", index=False)
+            if not df_excluded.empty:
+                df_excluded.to_excel(
+                    writer, sheet_name="Excluded_DIRECTDEBIT_TAIBM", index=False
+                )
+            if not df_oracle_details.empty:
+                df_oracle_details.to_excel(
+                    writer, sheet_name="Oracle_Details", index=False
+                )
+
         print("\n[OK] Done!")
         print(f"- PDFs read from: {input_dir}")
         print(f"- Excel saved to: {output_path}\n")
@@ -1218,6 +1587,7 @@ def main():
         print("  2) You lack permission.")
         raise
 
+    # -------------------- WEBADI STEP --------------------
     template_path = None
     if args.webadi_template:
         template_path = Path(args.webadi_template)
@@ -1255,14 +1625,16 @@ def main():
             "Email Address",
             "Preferred Language",
             "Tax Registration Number",
+            "Hotel Name",  # usado agora para CUSTOMER_NAME
         }
-        present = [c for c in need_cols if c in df.columns]
 
+        present = [c for c in need_cols if c in df.columns]
         if not present:
             print("[WARN] Nenhuma coluna necessária para o WEBADI está disponível.")
         else:
             df2 = df.loc[
-                (df["Expedia ID"].notna()) | (df["Legal Name"].notna()), present
+                (df["Expedia ID"].notna()) | (df["Legal Name"].notna()),
+                present,
             ]
             if not len(df2):
                 print("[WARN] Nada para inserir no WEBADI (sem Expedia ID / Legal Name).")
@@ -1282,12 +1654,14 @@ def main():
                 except Exception as ex:
                     print(f"[ERROR] Falha ao preencher WEBADI: {ex}")
                     print(
-                        "Sugestões: confira o nome da aba, desproteja a planilha (se necessário), e valide a linha do cabeçalho."
+                        "Sugestões: confira o nome da aba, desproteja a planilha (se necessário), "
+                        "e valide a linha do cabeçalho."
                     )
     else:
         print(
             "[INFO] Passo WEBADI não executado (sem --webadi_template e sem template padrão encontrado)."
         )
+
 
 if __name__ == "__main__":
     main()
