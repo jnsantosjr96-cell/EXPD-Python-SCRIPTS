@@ -49,6 +49,7 @@ BASE_QUERY = """
 SELECT
     CTA.TRX_NUMBER              AS "Transaction Number",
     CTTA.NAME                   AS "Transaction Type",
+    CTA.TRX_DATE                AS "Transaction Date",
     HCA.ACCOUNT_NUMBER          AS "Account Number",
     CTA.INVOICE_CURRENCY_CODE   AS "Entered Currency",
     AAA.AMOUNT                  AS "Entered Amount",
@@ -298,8 +299,7 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
     col_total_amt  = "AP"  # Total Amt
 
     # Columns that must preserve default value from row 10 (includes AH)
-    # Ajustado: removidas colunas T (Credit Reason) e V (skip workflow),
-    # para que fiquem em branco nas novas linhas.
+    # T (Credit Reason) and V (skip workflow) removidas para ficarem em branco
     preserve_letters = ["X", "AH", "AI", "AJ", "AK", "AQ", "AR", "AS"]
 
     # 4) Insert rows starting at row 11 (row 10 = template defaults)
@@ -469,8 +469,16 @@ def main():
     df_coa_match["CURRENCY_CODE"] = df_coa_match["CURRENCY_CODE"].astype(str).str.strip()
     df_coa_match["receipt_amount"] = df_coa_match["LOCAL_RECEIPT_AMOUNT"].round(2)
 
+    # Payment date from column T (20ª coluna), se existir
+    if df_coa.shape[1] > 19:
+        payment_raw = df_coa.iloc[:, 19]
+        df_coa_match["PAYMENT_DATE"] = pd.to_datetime(payment_raw, errors="coerce")
+    else:
+        df_coa_match["PAYMENT_DATE"] = pd.NaT
+
     # ========= WO MATCHES (SUMIFS by TRANSACTION NUMBER) + CSV =========
-    req_wo = ["Transaction Number", "Transaction Type", "Account Number", "Entered Amount", "Entered Currency"]
+    req_wo = ["Transaction Number", "Transaction Type", "Transaction Date",
+              "Account Number", "Entered Amount", "Entered Currency"]
     miss_wo = [c for c in req_wo if c not in df_wo.columns]
     if miss_wo:
         print(f"Missing columns in WO: {miss_wo}. Skipping WO matches / CSV.")
@@ -523,6 +531,7 @@ def main():
                 "Transaction Number",
                 "Entered Currency",
                 "sum_amount",
+                "PAYMENT_DATE",
             ],
         ].drop_duplicates()
 
@@ -574,8 +583,16 @@ def main():
                     "sum_amount": "first",       # SUMIFS by TRX
                     "Entered Amount": "sum",     # sum of adjustments for that invoice
                     "RECEIPT_STATUS": "first",
+                    "Transaction Date": "first",
+                    "PAYMENT_DATE": "first",
                 })
             )
+
+            # Days between payment and invoice
+            if "PAYMENT_DATE" in df_matches_agg.columns and "Transaction Date" in df_matches_agg.columns:
+                df_matches_agg["Days Between Payment and Invoice"] = (
+                    (df_matches_agg["PAYMENT_DATE"] - df_matches_agg["Transaction Date"]).dt.days
+                )
 
             df_matches = df_matches_agg.rename(columns={
                 "receipt_amount": "LOCAL_RECEIPT_AMOUNT",
@@ -584,42 +601,79 @@ def main():
                 "Entered Currency": "WO Currency",
             })
 
-            # Write Matches sheet back into COA
+            # --- Split DIR vs non-DIR for CSV and NL review ---
+            dir_mask = df_matches["Transaction Type"].astype(str).str.contains("DIR", case=False, na=False)
+            df_matches_dir = df_matches[dir_mask].copy()
+            df_nl_review = df_matches[~dir_mask].copy()
+
+            # --- UNKNOWN / UNKNWON OID currency matches ---
+            df_unknown_matches = None
+            unknown_mask = df_coa_match["CUSTOMER_NBR"].astype(str).str.upper().isin(["UNKNOWN", "UNKNWON"])
+            df_unknown = df_coa_match[unknown_mask].copy()
+
+            if not df_unknown.empty:
+                df_unknown_tmp = df_unknown[["RECEIPT_NUMBER", "receipt_amount", "CURRENCY_CODE"]].copy()
+                df_unknown_tmp = df_unknown_tmp.rename(columns={"CURRENCY_CODE": "Entered Currency"})
+
+                merged_unknown = df_unknown_tmp.merge(
+                    df_wo_sum_trx[["Account Number", "Transaction Number", "Entered Currency", "sum_amount"]],
+                    on="Entered Currency",
+                    how="inner",
+                )
+
+                cond_unknown = merged_unknown["receipt_amount"] == (-merged_unknown["sum_amount"])
+                df_unknown_matches = merged_unknown.loc[cond_unknown].drop_duplicates()
+
+            # Write Matches, NL review and Unknown OID Matches back into COA
             with pd.ExcelWriter(coa_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
                 df_matches.to_excel(w, sheet_name="Matches", index=False)
-            print(f"Sheet 'Matches' created with {len(df_matches)} rows (1 row per RECEIPT_NUMBER).")
+                print(f"Sheet 'Matches' created with {len(df_matches)} rows (1 row per RECEIPT_NUMBER).")
+
+                if not df_nl_review.empty:
+                    df_nl_review.to_excel(w, sheet_name="NL review", index=False)
+                    print(f"Sheet 'NL review' created with {len(df_nl_review)} rows (non-DIR Transaction Type).")
+
+                if df_unknown_matches is not None and not df_unknown_matches.empty:
+                    df_unknown_matches.to_excel(w, sheet_name="Unknown OID Matches", index=False)
+                    print(f"Sheet 'Unknown OID Matches' created with {len(df_unknown_matches)} rows.")
 
             # Dates for file naming and comments
             today = date.today()
             today_csv_name = today.strftime("%m%d%Y")
             today_comment = today.strftime("%m/%d/%Y")
 
-            # Separate file for Cash (mirroring Matches sheet)
+            # Separate file for Cash (espelha Matches; mantém todas as linhas)
             cash_xlsx_name = f"COAvsWO_Cash_{today_csv_name}.xlsx"
             cash_xlsx_path = OUTPUT_FOLDER / cash_xlsx_name
             df_matches.to_excel(cash_xlsx_path, index=False)
             print(f"Cash file generated with {len(df_matches)} rows at:\n{cash_xlsx_path}")
 
-            # COAvsWO CSV from aggregated matches (1 row per TRX / RECEIPT)
-            df_csv = pd.DataFrame()
-            df_csv["Index"] = range(1, len(df_matches_agg) + 1)
-            oper_units = df_matches_agg["Transaction Type"].map(map_operating_unit)
-            df_csv["Operating Unit"] = oper_units
-            df_csv["Transaction Number"] = df_matches_agg["Transaction Number"]
-            df_csv["BFB Number"] = ""
-            df_csv["Activity Name"] = oper_units.map(map_activity_name)
-            df_csv["Adjustment Type"] = "Line"
-            # positive value (invert sign of Entered Amount)
-            df_csv["Amount to be Adjusted"] = (-df_matches_agg["Entered Amount"]).round(2)
-            df_csv["Reason"] = "Uneconomical to Collect"
-            df_csv["Comments"] = "COA vs WO " + today_comment
-            df_csv["GL Date"] = ""
-            df_csv["Adjust Date"] = ""
+            # COAvsWO CSV from aggregated matches, somente DIR
+            df_matches_agg_dir = df_matches_agg[dir_mask.values].copy()
 
-            csv_name = f"COAvsWO{today_csv_name}.csv"
-            csv_path = OUTPUT_FOLDER / csv_name
-            df_csv.to_csv(csv_path, index=False, encoding="cp1252")
-            print(f"CSV generated with {len(df_csv)} rows at:\n{csv_path}")
+            if df_matches_agg_dir.empty:
+                print("No DIR transactions found in Matches. CSV will not be generated.")
+                csv_path = None
+            else:
+                df_csv = pd.DataFrame()
+                df_csv["Index"] = range(1, len(df_matches_agg_dir) + 1)
+                oper_units = df_matches_agg_dir["Transaction Type"].map(map_operating_unit)
+                df_csv["Operating Unit"] = oper_units
+                df_csv["Transaction Number"] = df_matches_agg_dir["Transaction Number"]
+                df_csv["BFB Number"] = ""
+                df_csv["Activity Name"] = oper_units.map(map_activity_name)
+                df_csv["Adjustment Type"] = "Line"
+                # positive value (invert sign of Entered Amount)
+                df_csv["Amount to be Adjusted"] = (-df_matches_agg_dir["Entered Amount"]).round(2)
+                df_csv["Reason"] = "Uneconomical to Collect"
+                df_csv["Comments"] = "COA vs WO " + today_comment
+                df_csv["GL Date"] = ""
+                df_csv["Adjust Date"] = ""
+
+                csv_name = f"COAvsWO{today_csv_name}.csv"
+                csv_path = OUTPUT_FOLDER / csv_name
+                df_csv.to_csv(csv_path, index=False, encoding="cp1252")
+                print(f"CSV generated with {len(df_csv)} rows at:\n{csv_path}")
 
     # ========= RELO MATCHES (SUMIFS by TRANSACTION NUMBER) + RELO DM =========
     relo_dm_path = None
@@ -706,7 +760,7 @@ def main():
                     print(f"Failed to generate RELO DM file: {e}")
 
     # Send email via Outlook with output files (including RELO DM if generated)
-    if csv_path is not None and 'cash_xlsx_path' in locals() and cash_xlsx_path is not None:
+    if 'csv_path' in locals() and csv_path is not None and 'cash_xlsx_path' in locals() and cash_xlsx_path is not None:
         today_comment = date.today().strftime("%m/%d/%Y")
         email_to = "hotelcollectbilling@expedia.com"
         email_subject = f"COA vs WO {today_comment}"
