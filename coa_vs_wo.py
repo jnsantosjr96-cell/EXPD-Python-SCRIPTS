@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 from datetime import date
+import re
 
 import oracledb
 import pandas as pd
@@ -47,14 +48,14 @@ DSN      = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
 # WO adjustments query
 BASE_QUERY = """
 SELECT
-    CTA.TRX_NUMBER              AS "Transaction Number",
-    CTTA.NAME                   AS "Transaction Type",
-    CTA.TRX_DATE                AS "Transaction Date",
-    HCA.ACCOUNT_NUMBER          AS "Account Number",
-    CTA.INVOICE_CURRENCY_CODE   AS "Entered Currency",
-    AAA.AMOUNT                  AS "Entered Amount",
-    AAA.ADJUSTMENT_NUMBER       AS "Adjustment Number",
-    AAA.REASON_CODE             AS "Reason Code"
+CTA.TRX_NUMBER              AS "Transaction Number",
+CTTA.NAME                   AS "Transaction Type",
+CTA.TRX_DATE                AS "Transaction Date",
+HCA.ACCOUNT_NUMBER          AS "Account Number",
+CTA.INVOICE_CURRENCY_CODE   AS "Entered Currency",
+AAA.AMOUNT                  AS "Entered Amount",
+AAA.ADJUSTMENT_NUMBER       AS "Adjustment Number",
+AAA.REASON_CODE             AS "Reason Code"
 FROM AR.AR_ADJUSTMENTS_ALL      AAA
 JOIN AR.RA_CUSTOMER_TRX_ALL     CTA  ON CTA.CUSTOMER_TRX_ID   = AAA.CUSTOMER_TRX_ID
 JOIN AR.RA_CUST_TRX_TYPES_ALL   CTTA ON CTTA.CUST_TRX_TYPE_ID = CTA.CUST_TRX_TYPE_ID
@@ -62,36 +63,36 @@ JOIN AR.HZ_CUST_ACCOUNTS        HCA  ON HCA.CUST_ACCOUNT_ID   = CTA.BILL_TO_CUST
 JOIN APPS.HR_OPERATING_UNITS    HOU  ON HOU.ORGANIZATION_ID   = CTA.ORG_ID
 JOIN APPS.GL_LEDGER_LE_V        GLL  ON GLL.LEGAL_ENTITY_ID   = HOU.DEFAULT_LEGAL_CONTEXT_ID
 WHERE
-    GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
-    AND CTTA.NAME NOT LIKE '%EAC%'
-    AND NOT (UPPER(CTTA.NAME) LIKE '%GROUP%' AND UPPER(CTTA.NAME) NOT LIKE '%XLR%')
-    AND (
-        INSTR(HOU.NAME, '11105') > 0
-        OR INSTR(HOU.NAME, '11115') > 0
-        OR INSTR(HOU.NAME, '12305') > 0
-        OR INSTR(HOU.NAME, '14101') > 0
-        OR INSTR(HOU.NAME, '23310') > 0
-        OR INSTR(HOU.NAME, '72110') > 0
-    )
-    AND HCA.ACCOUNT_NUMBER IN ({placeholders})
+GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
+AND CTTA.NAME NOT LIKE '%EAC%'
+AND NOT (UPPER(CTTA.NAME) LIKE '%GROUP%' AND UPPER(CTTA.NAME) NOT LIKE '%XLR%')
+AND (
+INSTR(HOU.NAME, '11105') > 0
+OR INSTR(HOU.NAME, '11115') > 0
+OR INSTR(HOU.NAME, '12305') > 0
+OR INSTR(HOU.NAME, '14101') > 0
+OR INSTR(HOU.NAME, '23310') > 0
+OR INSTR(HOU.NAME, '72110') > 0
+)
+AND HCA.ACCOUNT_NUMBER IN ({placeholders})
 ORDER BY
-    HCA.ACCOUNT_NUMBER,
-    CTA.TRX_NUMBER,
-    AAA.ADJUSTMENT_NUMBER
+HCA.ACCOUNT_NUMBER,
+CTA.TRX_NUMBER,
+AAA.ADJUSTMENT_NUMBER
 """
 
 # RELO CMs query (with Reference)
 RELO_QUERY = """
 SELECT
-    CTA.TRX_NUMBER                  AS "Transaction Number",
-    CTTA.NAME                       AS "Transaction Type",
-    HCA.ACCOUNT_NUMBER              AS "Account Number",
-    CTA.INVOICE_CURRENCY_CODE       AS "Entered Currency",
-    PSA.AMOUNT_DUE_ORIGINAL         AS "Entered Amount",
-    PSA.AMOUNT_DUE_REMAINING        AS "Open Balance",
-    CTA.REASON_CODE                 AS "Reason Code",
-    CTA.TRX_DATE                    AS "Transaction Date",
-    CTA.INTERFACE_HEADER_ATTRIBUTE1 AS "Reference"
+CTA.TRX_NUMBER                  AS "Transaction Number",
+CTTA.NAME                       AS "Transaction Type",
+HCA.ACCOUNT_NUMBER              AS "Account Number",
+CTA.INVOICE_CURRENCY_CODE       AS "Entered Currency",
+PSA.AMOUNT_DUE_ORIGINAL         AS "Entered Amount",
+PSA.AMOUNT_DUE_REMAINING        AS "Open Balance",
+CTA.REASON_CODE                 AS "Reason Code",
+CTA.TRX_DATE                    AS "Transaction Date",
+CTA.INTERFACE_HEADER_ATTRIBUTE1 AS "Reference"
 FROM AR.RA_CUSTOMER_TRX_ALL      CTA
 JOIN AR.RA_CUST_TRX_TYPES_ALL    CTTA ON CTTA.CUST_TRX_TYPE_ID = CTA.CUST_TRX_TYPE_ID
 JOIN AR.HZ_CUST_ACCOUNTS         HCA  ON HCA.CUST_ACCOUNT_ID   = CTA.BILL_TO_CUSTOMER_ID
@@ -99,20 +100,218 @@ JOIN AR.AR_PAYMENT_SCHEDULES_ALL PSA  ON PSA.CUSTOMER_TRX_ID   = CTA.CUSTOMER_TR
 JOIN APPS.HR_OPERATING_UNITS     HOU  ON HOU.ORGANIZATION_ID   = CTA.ORG_ID
 JOIN APPS.GL_LEDGER_LE_V         GLL  ON GLL.LEGAL_ENTITY_ID   = HOU.DEFAULT_LEGAL_CONTEXT_ID
 WHERE
-    GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
-    AND PSA.CLASS = 'CM'
-    AND CTA.REASON_CODE LIKE '%OFFSET_ACCRUED_AR%'
-    AND CTTA.NAME IN (
-        'CH_DIR_CM_RELO_USD',
-        'US_DIR_CM_RELO_USD',
-        'TS_DIR_CM_RELO_USD',
-        'BR_DIR_CM_RELO_BRL',
-        'TS_CM_RELO'
-    )
-    AND HCA.ACCOUNT_NUMBER IN ({placeholders})
+GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
+AND PSA.CLASS = 'CM'
+AND CTA.REASON_CODE LIKE '%OFFSET_ACCRUED_AR%'
+AND CTTA.NAME IN (
+'CH_DIR_CM_RELO_USD',
+'US_DIR_CM_RELO_USD',
+'TS_DIR_CM_RELO_USD',
+'BR_DIR_CM_RELO_BRL',
+'TS_CM_RELO'
+)
+AND HCA.ACCOUNT_NUMBER IN ({placeholders})
 ORDER BY
-    CTA.TRX_DATE DESC,
-    CTA.TRX_NUMBER
+CTA.TRX_DATE DESC,
+CTA.TRX_NUMBER
+"""
+
+# Nova query: Transaction Register p/ CMs da aba Match RELO + invoice aplicada
+CM_APPLIED_QUERY = """
+/*
+* Oracle Transaction Register - UAT
+* Author: Jose Santos (josenjr@expediagroup.com)
+*/
+
+SELECT  
+
+CASE 
+  WHEN HZP.COUNTRY in ('AS','AU','BD','BN','BT','CC','CK','CN','FJ','FM','GU','HK','ID','IN','JP','KH','KP','KR','LA','LK','MH','MM','MN','MO','MP','MV','MY','NC','NF','NP','NU','NZ','PF','PG','PH','PK','PW','SB','SG','TH','TK','TL','TO','TW','VN','VU','WF','WS')
+  THEN 'APAC'
+  WHEN HZP.COUNTRY in ('AG','AI','AN','AR','AW','BB','BL','BM','BO','BQ','BR','BS','BZ','CL','CO','CR','CU','CW','DM','DO','EC','FK','GD','GF','GP','GT','GY','HN','HT','JM','KN','KY','LC','MF','MQ','MS','MX','NI','PA','PE','PN','PR','PY','SR','SV','SX','TC','TT','UY','VC','VE','VG','VI')
+  THEN 'LATAM'
+  WHEN HZP.COUNTRY in ('AL','AM','AT','AZ','BA','BE','BG','BY','CH','CZ','DE','DK','EE','FI','FO','FR','GB','GE','GG','GL','HR','HU','IE','IS','JE','KG','KZ','LI','LT','LU','LV','MD','ME','MK','NL','NO','PL','PM','RO','RS','RU','SE','SH','SI','SJ','SK','TJ','TM','UA','UZ')
+  THEN 'N-EMEA'
+  WHEN HZP.COUNTRY in ('AD','AE','AF','AO','BF','BH','BI','BJ','BV','BW','CD','CF','CG','CI','CM','CV','CY','DJ','DZ','EG','ER','ES','ET','GA','GH','GI','GM','GN','GQ','GR','GW','IL','IQ','IR','IT','JO','KE','KM','KW','LB','LR','LS','LY','MA','MC','MG','ML','MR','MT','MU','MW','MZ','NA','NE','NG','OM','PS','PT','QA','RE','RW','SA','SC','SD','SL','SM','SN','SS','ST','SY','SZ','TD','TG','TN','TR','TZ','UG','VA','YE','YT','ZA','ZM','ZW')
+  THEN 'S-EMEA'
+  WHEN HZP.COUNTRY in ('CA','US')
+  THEN 'NAMER'
+  ELSE 'NOT_DEFINED'
+  END AS "POAR Super Region"
+
+,GLL.LEDGER_NAME "Ledger"
+,HOU.NAME "OU NAME"
+,SUBSTR(HOU.NAME,6,51) "Legal Entity"
+,SUBSTR(HOU.NAME,1,5) "Company"
+,PSA.INVOICE_CURRENCY_CODE "Currency"
+,PSA.CLASS "CLASS"
+,CTA.ATTRIBUTE4 "XLR ID"
+,CTA.TRX_NUMBER "Transaction Number"      -- CM number
+,CTTA.NAME "TRX Type Name"
+,HZP.PARTY_NAME "Customer Name"
+,HCA.ACCOUNT_NUMBER "Account Number"
+,CTA.TRX_DATE "TRX DATE"
+,PSA.GL_DATE "GL Date"
+,TO_CHAR(CTA.TRX_DATE,'YYYY-MM')  "Year / Month"
+,PSA.AMOUNT_DUE_ORIGINAL "Entered Amt"
+,PSA.AMOUNT_DUE_REMAINING "Open Balance"
+,CASE 
+    WHEN SUBSTR(CTTA.NAME,1,2) in ('CH','US')
+    THEN ROUND(CTA.EXCHANGE_RATE * PSA.AMOUNT_DUE_ORIGINAL,2)
+    ELSE PSA.AMOUNT_DUE_ORIGINAL
+    END AS "Functional Amt"
+,CASE
+    WHEN PSA.INVOICE_CURRENCY_CODE = 'USD'
+    THEN 1
+    ELSE ROUND(GLDR.CONVERSION_RATE,15)
+    END AS "Conversion Rate"
+,CASE WHEN PSA.INVOICE_CURRENCY_CODE = 'USD'
+    THEN PSA.AMOUNT_DUE_ORIGINAL
+    ELSE ROUND(ROUND(GLDR.CONVERSION_RATE,15) * PSA.AMOUNT_DUE_ORIGINAL,11) 
+    END AS "USD Amount"
+,TO_CHAR(CTA.PRINTING_LAST_PRINTED ,'MM/DD/YYYY HH:MI')  "Invoice Print Date"
+,CTA.INTERFACE_HEADER_ATTRIBUTE1 "Reference"
+,CTA.COMMENTS "Comments"
+,CTA.INTERFACE_HEADER_CONTEXT "Batch Name"
+,CTA.REASON_CODE "Reason Code"
+,ARM.NAME "Receipt Method"
+,HZP.CITY "City"
+,HZP.COUNTRY "Country"
+,ROUND(CTLA.TAX_AMOUNT,2) "Tax Amount"
+,CASE  WHEN PSA.AMOUNT_IN_DISPUTE IS NULL
+    THEN 0
+    ELSE PSA.AMOUNT_IN_DISPUTE
+    END AS "Amount In Dispute"
+,CASE WHEN PSA.AMOUNT_IN_DISPUTE IS NULL or PSA.AMOUNT_IN_DISPUTE = '0.00'
+    THEN 'NO'
+    ELSE 'YES'
+    END AS "TRX ON DISPUTE"
+,CASE
+    WHEN PSA.DISPUTE_DATE IS NULL
+    THEN NULL
+    ELSE PSA.DISPUTE_DATE
+    END AS "Dispute Date"
+,HCA.ATTRIBUTE1 "Hotel ID"
+,TT.NAME "Term Name"
+,FNU.USER_NAME "Created By User"
+
+,CASE 
+WHEN HCA.CUSTOMER_CLASS_CODE = 'TA'
+    THEN 'Travel Ad'
+    WHEN HCA.CUSTOMER_CLASS_CODE = 'HOTEL'
+            AND CTTA.NAME NOT LIKE '%GROUP%'
+            THEN 'Hotel Collect Independent'
+    WHEN HCA.CUSTOMER_CLASS_CODE = 'HOTEL'
+            AND CTTA.NAME LIKE '%GROUP%'
+            THEN 'Hotel Collect Corporate'
+    WHEN HCA.CUSTOMER_CLASS_CODE = 'MESODB'
+    THEN 'Meso Direct Bill'
+    WHEN HCA.CUSTOMER_CLASS_CODE = 'SUPPLIER'
+            OR HCA.CUSTOMER_CLASS_CODE = 'OTHER'
+            OR CTTA.NAME LIKE '%SO'
+            THEN 'Supplier Other'
+    WHEN HCA.CUSTOMER_CLASS_CODE = 'GROUP PARENT'
+    THEN 'Hotel Collect Corporate'
+    WHEN HCA.CUSTOMER_CLASS_CODE = 'MESOMF'
+    THEN 'Meso Marketing Funds'
+    WHEN HCA.CUSTOMER_CLASS_CODE = 'ELE'
+    THEN 'Expedia Local Expert'
+    ELSE 'UNLABLED ITEM - PLEASE CONTACT ICORT'
+    END AS "Business Model"
+
+,CASE
+WHEN CTTA.NAME LIKE '%RELO%'
+    THEN 'RELO'
+    WHEN CTTA.NAME LIKE '%VOIDED%'
+    THEN 'VOIDED'
+    WHEN CTTA.NAME LIKE '%FRAUD%'
+    THEN 'FRAUD'
+    WHEN CTTA.NAME LIKE '%REBILL%'
+    THEN 'REBILL'
+    ELSE 'Standard TRX'
+    END AS "TRX Type"
+
+,CASE
+WHEN ARM.RECEIPT_METHOD_ID IN ('4004','56065','4009','4005','4003','4008','56066','39002','4002','4006','4000','4011','56064','32000','37000','39003','4010','72021','72020','72022')
+    THEN 'AP'
+    ELSE 'Non AP'
+    END AS "AP Status"
+
+/* >>> INVOICE EM QUE O CM ESTÁ APLICADO <<< */
+,INV.TRX_NUMBER  AS "Applied Invoice Number"
+,INV.TRX_DATE    AS "Applied Invoice Date"
+/* <<< FIM DO BLOCO >>> */
+
+FROM AR.RA_CUSTOMER_TRX_ALL CTA
+
+LEFT JOIN AR.HZ_CUST_ACCOUNTS HCA
+  ON CTA.BILL_TO_CUSTOMER_ID = HCA.CUST_ACCOUNT_ID
+
+LEFT JOIN AR.HZ_PARTIES HZP
+  ON HCA.PARTY_ID = HZP.PARTY_ID
+
+LEFT JOIN APPS.HR_OPERATING_UNITS HOU
+  ON HOU.ORGANIZATION_ID = CTA.ORG_ID
+
+LEFT JOIN APPS.GL_LEDGER_LE_V GLL
+  ON GLL.LEGAL_ENTITY_ID = HOU.DEFAULT_LEGAL_CONTEXT_ID
+
+LEFT JOIN AR.AR_PAYMENT_SCHEDULES_ALL PSA
+  ON PSA.CUSTOMER_TRX_ID = CTA.CUSTOMER_TRX_ID
+
+LEFT JOIN AR.AR_RECEIPT_METHODS ARM
+  ON CTA.RECEIPT_METHOD_ID = ARM.RECEIPT_METHOD_ID
+
+LEFT JOIN AR.RA_CUST_TRX_TYPES_ALL CTTA
+  ON CTTA.CUST_TRX_TYPE_ID = CTA.CUST_TRX_TYPE_ID
+
+LEFT JOIN APPS.AR_CUSTOMER_PROFILES_V CPV
+  ON HCA.CUST_ACCOUNT_ID = CPV.CUSTOMER_ID
+
+LEFT JOIN APPS.FND_USER FNU
+  ON FNU.USER_ID = CTA.CREATED_BY
+
+LEFT JOIN (
+  SELECT SUM(AR.RA_CUSTOMER_TRX_LINES_ALL.EXTENDED_AMOUNT) "TAX_AMOUNT",
+         AR.RA_CUSTOMER_TRX_LINES_ALL.CUSTOMER_TRX_ID,
+         AR.RA_CUSTOMER_TRX_LINES_ALL.LINE_TYPE
+  FROM AR.RA_CUSTOMER_TRX_LINES_ALL
+  WHERE AR.RA_CUSTOMER_TRX_LINES_ALL.LINE_TYPE = 'TAX'
+  GROUP BY AR.RA_CUSTOMER_TRX_LINES_ALL.CUSTOMER_TRX_ID,
+           AR.RA_CUSTOMER_TRX_LINES_ALL.LINE_TYPE
+) CTLA
+  ON CTA.CUSTOMER_TRX_ID = CTLA.CUSTOMER_TRX_ID
+
+LEFT JOIN (
+  SELECT GL.GL_DAILY_RATES.CONVERSION_RATE,
+         GL.GL_DAILY_RATES.FROM_CURRENCY,
+         GL.GL_DAILY_RATES.TO_CURRENCY,
+         GL.GL_DAILY_RATES.CONVERSION_DATE
+  FROM GL.GL_DAILY_RATES 
+  WHERE GL.GL_DAILY_RATES.TO_CURRENCY = 'USD'
+    AND GL.GL_DAILY_RATES.CONVERSION_TYPE = 'Corporate'
+) GLDR
+  ON (GLDR.FROM_CURRENCY = PSA.INVOICE_CURRENCY_CODE
+      AND GLDR.CONVERSION_DATE = PSA.GL_DATE)
+
+LEFT JOIN AR.RA_TERMS_TL TT
+  ON PSA.TERM_ID = TT.TERM_ID
+
+/* >>> JOINS CM -> INVOICE APLICADA <<< */
+LEFT JOIN AR.AR_RECEIVABLE_APPLICATIONS_ALL RAA
+  ON RAA.CUSTOMER_TRX_ID = CTA.CUSTOMER_TRX_ID   -- este CTA é o CM
+ AND RAA.APPLICATION_TYPE = 'CM'
+ AND RAA.DISPLAY = 'Y'
+
+LEFT JOIN AR.RA_CUSTOMER_TRX_ALL INV
+  ON INV.CUSTOMER_TRX_ID = RAA.APPLIED_CUSTOMER_TRX_ID   -- invoice onde o CM foi aplicado
+/* <<< FIM DAS NOVAS JOINS >>> */
+
+WHERE 
+  GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'  -- NEVER REMOVE
+  AND CTTA.NAME NOT LIKE '%EAC%'
+
+  AND CTA.TRX_NUMBER IN ({placeholders})
 """
 
 # ==========================
@@ -140,6 +339,7 @@ def update_concat_column_b(customers):
     ws = wb.active  # single sheet
 
     start_row = 2  # header
+
     for i, cust in enumerate(customers, start=start_row):
         ws.cell(row=i, column=2, value=cust)
 
@@ -190,16 +390,13 @@ def normalize_reason(reason):
     """Normalize reason codes like 'UNECONOMICAL_TO_COLLECT' -> 'Uneconomical to Collect'."""
     if pd.isna(reason) or not isinstance(reason, str) or not reason.strip():
         return "Uneconomical to Collect"
-
     reason_clean = reason.strip().upper()
-
     overrides = {
         "UNECONOMICAL_TO_COLLECT": "Uneconomical to Collect",
         "SMALL_AMT_REMAINING": "Small Amt Remaining",
     }
     if reason_clean in overrides:
         return overrides[reason_clean]
-
     return reason_clean.replace("_", " ").title()
 
 def send_outlook_email_with_attachments(to_addr, subject, body, attachments):
@@ -208,7 +405,7 @@ def send_outlook_email_with_attachments(to_addr, subject, body, attachments):
     attachments: list of Paths
     """
     if win32 is None:
-        print("pywin32 is not installed. Automatic Outlook email sending is not available.")
+        print("pywin32 is not installed.\nAutomatic Outlook email sending is not available.")
         return
 
     try:
@@ -266,11 +463,11 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
 
     Requirements in df_match_relo:
     - columns: ['RECEIPT_NUMBER','LOCAL_RECEIPT_AMOUNT','Transaction Number',
-                'Account Number','Transaction Type']
+                'Account Number','Transaction Type','WO Currency']
     """
     # 1) Filter only TS_CM_RELO
     if df_match_relo is None or df_match_relo.empty:
-        print("Match RELO is empty. No rows to generate RELO DM file.")
+        print("Match RELO is empty.\nNo rows to generate RELO DM file.")
         return None
 
     df_src = (
@@ -278,15 +475,22 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
         .loc[lambda d: d["Transaction Type"].astype(str).str.upper() == "TS_CM_RELO"]
         .copy()
     )
+
     if df_src.empty:
-        print("No RELO MATCH rows of type TS_CM_RELO. Nothing to generate.")
+        print("No RELO MATCH rows of type TS_CM_RELO.\nNothing to generate.")
         return None
 
     # Consolidate 1 row per (receipt, trx, account)
     df_src = (
         df_src
         .drop_duplicates(subset=["RECEIPT_NUMBER", "Transaction Number", "Account Number"])
-        .loc[:, ["RECEIPT_NUMBER", "Transaction Number", "Account Number", "LOCAL_RECEIPT_AMOUNT"]]
+        .loc[:, [
+            "RECEIPT_NUMBER",
+            "Transaction Number",
+            "Account Number",
+            "LOCAL_RECEIPT_AMOUNT",
+            "WO Currency",        # moeda do CM / Match RELO
+        ]]
         .copy()
     )
     df_src["AMOUNT_POS"] = df_src["LOCAL_RECEIPT_AMOUNT"].abs().round(2)
@@ -296,7 +500,6 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
         raise FileNotFoundError(f"Template .xlsm not found: {template_path}")
 
     wb = load_workbook(template_path, keep_vba=True, data_only=False)
-
     if "EVC RELO CM" not in wb.sheetnames:
         raise ValueError("Sheet 'EVC RELO CM' not found in template.")
 
@@ -312,8 +515,14 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
     col_context    = _find_col_letter_by_header(ws, "Context")
     col_line_num   = _find_col_letter_by_header(ws, "Line Number")  # sequential
 
-    col_unit_price = "AM"  # Unit Selling Price
-    col_qty        = "AN"  # Quantity
+    # tenta achar a coluna de moeda no template
+    try:
+        col_currency = _find_col_letter_by_header(ws, "Currency")
+    except KeyError:
+        col_currency = None  # se não existir, só não preenche
+
+    col_uom        = "AM"  # Unit of Measure
+    col_unit_price = "AN"  # Unit Selling Price
     col_total_amt  = "AP"  # Total Amt
 
     # Columns that must preserve default value from row 10 (includes AH)
@@ -329,17 +538,22 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
         trx_number     = rec["Transaction Number"]
         account_number = rec["Account Number"]
         amount_pos     = float(rec["AMOUNT_POS"])
+        wo_currency    = str(rec["WO Currency"]).strip() if pd.notna(rec["WO Currency"]) else ""
 
         r = start_row + i
 
         # Basic headers
         ws[f"{col_customer}{r}"] = str(account_number)
-        ws[f"{col_shipto}{r}"] = str(account_number)
+        ws[f"{col_shipto}{r}"]   = str(account_number)
         ws[f"{col_trx_date}{r}"] = today_dt
+
+        # Currency vinda da Match RELO (WO Currency)
+        if col_currency is not None:
+            ws[f"{col_currency}{r}"] = wo_currency
 
         # Txn Type = TS_DM_RELO (also explicitly in column P)
         ws[f"{col_txn_type}{r}"] = "TS_DM_RELO"
-        ws[f"P{r}"] = "TS_DM_RELO"
+        ws[f"P{r}"]              = "TS_DM_RELO"
 
         # Comments formula
         ws[f"{col_comments}{r}"] = '="COA vs WO " & TEXT(TODAY(),"mm/dd/yyyy")'
@@ -354,10 +568,10 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
         # Context also preserves default from row 10
         _copy_default_from_row(ws, col_context, 10, r)
 
-        # Line values (positive)
-        ws[f"{col_unit_price}{r}"] = amount_pos   # AM
-        ws[f"{col_qty}{r}"] = 1                   # AN
-        ws[f"{col_total_amt}{r}"] = amount_pos    # AP
+        # Line values
+        ws[f"{col_uom}{r}"]        = "EA"        # AM: Unit of Measure
+        ws[f"{col_unit_price}{r}"] = amount_pos  # AN: Unit Selling Price
+        ws[f"{col_total_amt}{r}"]  = amount_pos  # AP: Total Amt
 
         # Line Number sequential, BUT NOT if "Line Number" column is AH (we keep row 10 value)
         if col_line_num != "AH":
@@ -367,8 +581,129 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
     out_name = f"4 Non-Lodging Relo DM_{today_dt.strftime('%m%d%Y')}.xlsm"
     out_path = out_dir / out_name
     wb.save(out_path)
+
     print(f"RELO DM file generated: {out_path}")
     return out_path
+
+# ==========================
+# NOVAS FUNÇÕES: comparação Reference x Applied Invoice Number
+# ==========================
+
+def _extract_invoice_from_reference(ref: str) -> str:
+    """
+    Remove o prefixo 'CREDIT INVOICE' e retorna só o número da invoice
+    que está na Reference da query de Relo CMs.
+    """
+    if pd.isna(ref):
+        return ""
+    s = str(ref).strip()
+    # remove 'CREDIT INVOICE' (case-insensitive)
+    s = re.sub(r"(?i)^CREDIT\s+INVOICE\s*", "", s).strip()
+    # pega a primeira sequência de dígitos (se existir)
+    m = re.search(r"\d+", s)
+    return m.group(0) if m else s
+
+def check_relo_cms_already_reversed(df_match_relo: pd.DataFrame, coa_path: Path):
+    """
+    1) Pega todos os CMs da aba Match RELO
+    2) Roda a CM_APPLIED_QUERY no Oracle (só para esses CMs)
+    3) Compara Reference (limpa) x Applied Invoice Number
+    4) CMs onde não bate (e têm Applied Invoice Number preenchido) vão
+       para a aba 'CMs Already Reversed' na planilha-mãe.
+    """
+    if df_match_relo is None or df_match_relo.empty:
+        print("Match RELO vazio. Nada para comparar com Applied Invoice Number.")
+        return
+
+    # Lista de CMs únicos da aba Match RELO
+    cm_list = (
+        df_match_relo["Transaction Number"]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+    if not cm_list:
+        print("Nenhum CM encontrado em Match RELO.")
+        return
+
+    print(f"Rodando CM_APPLIED_QUERY para {len(cm_list)} CM(s) da aba Match RELO...")
+
+    # Conecta no Oracle só para essa query (oracledb.init_oracle_client já foi chamado no main)
+    with oracledb.connect(user=USERNAME, password=PASSWORD, dsn=DSN) as conn:
+        with conn.cursor() as cur:
+            placeholders = ", ".join(f":cm{i}" for i in range(len(cm_list)))
+            sql_cm = CM_APPLIED_QUERY.format(placeholders=placeholders)
+            params = {f"cm{i}": v for i, v in enumerate(cm_list)}
+            cur.execute(sql_cm, params)
+            rows = cur.fetchall()
+            if not rows:
+                print("CM_APPLIED_QUERY não retornou linhas.")
+                return
+            cols = [d[0] for d in cur.description]
+            df_cm = pd.DataFrame(rows, columns=cols)
+
+    # Garantir tipos string nas colunas-chave
+    df_cm["Transaction Number"] = df_cm["Transaction Number"].astype(str).str.strip()
+    df_cm["Applied Invoice Number"] = (
+        df_cm["Applied Invoice Number"].astype(str).str.strip()
+    )
+
+    # Referência original da query de Relo CMs (Match RELO já tem a coluna Reference)
+    df_ref = df_match_relo.copy()
+    df_ref["Transaction Number"] = df_ref["Transaction Number"].astype(str).str.strip()
+    df_ref["Reference_Invoice"] = (
+        df_ref["Reference"]
+        .apply(_extract_invoice_from_reference)
+        .astype(str)
+        .str.strip()
+    )
+
+    # Trazer Applied Invoice Number para as linhas de Match RELO
+    df_applied_small = (
+        df_cm[["Transaction Number", "Applied Invoice Number"]]
+        .drop_duplicates(subset=["Transaction Number"])
+        .copy()
+    )
+
+    df_check = df_ref.merge(
+        df_applied_small,
+        on="Transaction Number",
+        how="left",
+    )
+
+    # Considerar "já revertido" apenas quando existe Applied Invoice Number
+    # e ele NÃO é igual ao número de invoice que está na Reference
+    mask_has_applied = df_check["Applied Invoice Number"].notna() & (
+        df_check["Applied Invoice Number"].astype(str).str.strip() != ""
+    )
+    mask_diff = (
+        df_check["Reference_Invoice"].astype(str).str.strip()
+        != df_check["Applied Invoice Number"].astype(str).str.strip()
+    )
+    df_reversed = df_check[mask_has_applied & mask_diff].copy()
+
+    if df_reversed.empty:
+        print(
+            "Nenhum CM da aba Match RELO foi identificado como 'Already Reversed' "
+            "(Reference bate com Applied Invoice Number ou não há aplicação)."
+        )
+        return
+
+    # Marca explicitamente o status
+    df_reversed["Status"] = "CMs Already Reversed"
+
+    # Grava nova aba na planilha-mãe
+    with pd.ExcelWriter(
+        coa_path, engine="openpyxl", mode="a", if_sheet_exists="replace"
+    ) as w:
+        df_reversed.to_excel(w, sheet_name="CMs Already Reversed", index=False)
+
+    print(
+        f"Aba 'CMs Already Reversed' criada com {len(df_reversed)} linha(s) "
+        "onde Reference != Applied Invoice Number."
+    )
 
 # ==========================
 # MAIN PIPELINE
@@ -416,7 +751,6 @@ def main():
             print("ALTER SESSION SET CURRENT_SCHEMA = APPS executed.")
 
         total_chunks = (len(customers) + 999) // 1000
-
         for idx, acc_chunk in enumerate(chunk_list(customers, 1000), start=1):
             print(f"\n[Batch {idx}/{total_chunks}] Accounts: {len(acc_chunk)}")
             print("First accounts:", acc_chunk[:5])
@@ -434,7 +768,7 @@ def main():
                         if wo_columns is None:
                             wo_columns = [d[0] for d in cur.description]
                         all_wo_rows.extend(rows)
-                    print(f"  -> WO: {len(rows)} rows")
+                        print(f"  -> WO: {len(rows)} rows")
             except oracledb.DatabaseError as e:
                 error, = e.args
                 print(f"  !! ERROR in WO batch {idx}: {error.message}")
@@ -450,14 +784,14 @@ def main():
                         if relo_columns is None:
                             relo_columns = [d[0] for d in cur.description]
                         all_relo_rows.extend(rows)
-                    print(f"  -> RELO: {len(rows)} rows")
+                        print(f"  -> RELO: {len(rows)} rows")
             except oracledb.DatabaseError as e:
                 error, = e.args
                 print(f"  !! ERROR in RELO batch {idx}: {error.message}")
                 break
 
     if not all_wo_rows:
-        print("No rows returned for WO. Exiting.")
+        print("No rows returned for WO.\nExiting.")
         return
 
     df_wo = pd.DataFrame(all_wo_rows, columns=wo_columns)
@@ -522,13 +856,12 @@ def main():
         mask_group = df_wo_m["Transaction Type"].str.contains("GROUP", case=False, na=False)
         mask_xlr = df_wo_m["Transaction Type"].str.contains("XLR", case=False, na=False)
         group_only_trx = df_wo_m.loc[mask_group & ~mask_xlr, "Transaction Number"].unique()
-
         if len(group_only_trx) > 0:
             print(
                 f"Excluding {len(group_only_trx)} Transaction Number(s) whose "
                 "Transaction Type contains 'GROUP' but not 'XLR' from WO matching."
             )
-            df_wo_m = df_wo_m[~df_wo_m["Transaction Number"].isin(group_only_trx)].copy()
+        df_wo_m = df_wo_m[~df_wo_m["Transaction Number"].isin(group_only_trx)].copy()
 
         # SUMIFS by (Account Number, Transaction Number, Currency)
         df_wo_sum_trx = (
@@ -623,12 +956,13 @@ def main():
                 df_matches_agg["Days Between Payment and Invoice"] = (
                     (df_matches_agg["PAYMENT_DATE"] - df_matches_agg["Transaction Date"]).dt.days
                 )
-                # Split negative days
-                neg_mask = df_matches_agg["Days Between Payment and Invoice"] < 0
-                df_negative_days = df_matches_agg[neg_mask].copy()
-                df_matches_agg = df_matches_agg[~neg_mask].copy()
             else:
-                df_negative_days = pd.DataFrame()
+                df_matches_agg["Days Between Payment and Invoice"] = pd.NA
+
+            # Split negative days
+            neg_mask = df_matches_agg["Days Between Payment and Invoice"] < 0
+            df_negative_days = df_matches_agg[neg_mask].copy()
+            df_matches_agg = df_matches_agg[~neg_mask].copy()
 
             df_matches = df_matches_agg.rename(columns={
                 "receipt_amount": "LOCAL_RECEIPT_AMOUNT",
@@ -646,19 +980,18 @@ def main():
             df_unknown_matches = None
             unknown_mask = df_coa_match["CUSTOMER_NBR"].astype(str).str.upper().isin(["UNKNOWN", "UNKNWON"])
             df_unknown = df_coa_match[unknown_mask].copy()
-
             if not df_unknown.empty:
                 df_unknown_tmp = df_unknown[["RECEIPT_NUMBER", "receipt_amount", "CURRENCY_CODE"]].copy()
                 df_unknown_tmp = df_unknown_tmp.rename(columns={"CURRENCY_CODE": "Entered Currency"})
-
                 merged_unknown = df_unknown_tmp.merge(
                     df_wo_sum_trx[["Account Number", "Transaction Number", "Entered Currency", "sum_amount"]],
                     on="Entered Currency",
                     how="inner",
                 )
-
                 cond_unknown = merged_unknown["receipt_amount"] == (-merged_unknown["sum_amount"])
                 df_unknown_matches = merged_unknown.loc[cond_unknown].drop_duplicates()
+            else:
+                df_unknown_matches = None
 
             # Write Matches, NL review, Unknown OID Matches and Negative Days back into COA
             with pd.ExcelWriter(coa_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
@@ -696,13 +1029,13 @@ def main():
 
             # COAvsWO CSV from aggregated matches, DIR only
             df_matches_agg_dir = df_matches_agg[dir_mask.values].copy()
-
             if df_matches_agg_dir.empty:
-                print("No DIR transactions found in Matches. CSV will not be generated.")
+                print("No DIR transactions found in Matches.\nCSV will not be generated.")
                 csv_path = None
             else:
                 df_csv = pd.DataFrame()
                 df_csv["Index"] = range(1, len(df_matches_agg_dir) + 1)
+
                 oper_units = df_matches_agg_dir["Transaction Type"].map(map_operating_unit)
                 df_csv["Operating Unit"] = oper_units
                 df_csv["Transaction Number"] = df_matches_agg_dir["Transaction Number"]
@@ -730,6 +1063,8 @@ def main():
 
     # ========= RELO MATCHES (SUMIFS by TRANSACTION NUMBER) + RELO DM =========
     relo_dm_path = None
+    df_match_relo = None
+
     if df_relo is not None:
         req_relo = [
             "Transaction Number", "Transaction Type",
@@ -799,7 +1134,7 @@ def main():
                 print(f"Sheet 'Match RELO' created with {len(df_match_relo)} rows.")
 
                 # Also write Match RELO into the Cash file, if generated
-                if 'cash_xlsx_path' in locals() and cash_xlsx_path is not None:
+                if "cash_xlsx_path" in locals() and cash_xlsx_path is not None:
                     with pd.ExcelWriter(cash_xlsx_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
                         df_match_relo.to_excel(w, sheet_name="Match RELO", index=False)
                     print(f"Sheet 'Match RELO' added to Cash file: {cash_xlsx_path}")
@@ -812,8 +1147,14 @@ def main():
                 except Exception as e:
                     print(f"Failed to generate RELO DM file: {e}")
 
+                # NOVO STEP: comparar Reference x Applied Invoice Number
+                try:
+                    check_relo_cms_already_reversed(df_match_relo, coa_path)
+                except Exception as e:
+                    print(f"Falha ao rodar checagem de 'CMs Already Reversed': {e}")
+
     # Send email via Outlook with output files (including RELO DM if generated)
-    if 'csv_path' in locals() and csv_path is not None and 'cash_xlsx_path' in locals() and cash_xlsx_path is not None:
+    if "csv_path" in locals() and csv_path is not None and "cash_xlsx_path" in locals() and cash_xlsx_path is not None:
         today_comment = date.today().strftime("%m/%d/%Y")
         email_to = "hotelcollectbilling@expedia.com"
         email_subject = f"COA vs WO {today_comment}"
@@ -821,12 +1162,11 @@ def main():
             f"Hi team,\n\n"
             f"Please see attached the COA vs WO outputs for {today_comment}.\n\n"
             f"Best regards,\n"
-            f"José\n"
+            f"Jos\n"
         )
         attachments = [csv_path, cash_xlsx_path]
-        if 'relo_dm_path' in locals() and relo_dm_path:
+        if "relo_dm_path" in locals() and relo_dm_path:
             attachments.append(relo_dm_path)
-
         send_outlook_email_with_attachments(email_to, email_subject, email_body, attachments)
 
 if __name__ == "__main__":
