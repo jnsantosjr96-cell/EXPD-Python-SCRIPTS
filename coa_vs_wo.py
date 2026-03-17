@@ -41,7 +41,7 @@ RELO_DM_TEMPLATE = Path(
 
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
 USERNAME = "josenjr"
-PASSWORD = "eyX057UWzLnZTl3w"      # CHANGE ME
+PASSWORD = "qyuxYQZFs13"      # CHANGE ME
 DSN      = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
 
 # WO adjustments query
@@ -53,7 +53,8 @@ SELECT
     HCA.ACCOUNT_NUMBER          AS "Account Number",
     CTA.INVOICE_CURRENCY_CODE   AS "Entered Currency",
     AAA.AMOUNT                  AS "Entered Amount",
-    AAA.ADJUSTMENT_NUMBER       AS "Adjustment Number"
+    AAA.ADJUSTMENT_NUMBER       AS "Adjustment Number",
+    AAA.REASON_CODE             AS "Reason Code"
 FROM AR.AR_ADJUSTMENTS_ALL      AAA
 JOIN AR.RA_CUSTOMER_TRX_ALL     CTA  ON CTA.CUSTOMER_TRX_ID   = AAA.CUSTOMER_TRX_ID
 JOIN AR.RA_CUST_TRX_TYPES_ALL   CTTA ON CTTA.CUST_TRX_TYPE_ID = CTA.CUST_TRX_TYPE_ID
@@ -63,6 +64,7 @@ JOIN APPS.GL_LEDGER_LE_V        GLL  ON GLL.LEGAL_ENTITY_ID   = HOU.DEFAULT_LEGA
 WHERE
     GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
     AND CTTA.NAME NOT LIKE '%EAC%'
+    AND NOT (UPPER(CTTA.NAME) LIKE '%GROUP%' AND UPPER(CTTA.NAME) NOT LIKE '%XLR%')
     AND (
         INSTR(HOU.NAME, '11105') > 0
         OR INSTR(HOU.NAME, '11115') > 0
@@ -184,6 +186,22 @@ def map_activity_name(oper_unit: str) -> str:
         return "BR WRITE-OFF BAD DEBT"
     return ""
 
+def normalize_reason(reason):
+    """Normalize reason codes like 'UNECONOMICAL_TO_COLLECT' -> 'Uneconomical to Collect'."""
+    if pd.isna(reason) or not isinstance(reason, str) or not reason.strip():
+        return "Uneconomical to Collect"
+
+    reason_clean = reason.strip().upper()
+
+    overrides = {
+        "UNECONOMICAL_TO_COLLECT": "Uneconomical to Collect",
+        "SMALL_AMT_REMAINING": "Small Amt Remaining",
+    }
+    if reason_clean in overrides:
+        return overrides[reason_clean]
+
+    return reason_clean.replace("_", " ").title()
+
 def send_outlook_email_with_attachments(to_addr, subject, body, attachments):
     """
     Send an e-mail via Outlook (if pywin32 and Outlook are available).
@@ -234,7 +252,7 @@ def _find_col_letter_by_header(ws, header_text, search_rows=range(1, 20)):
 def _copy_default_from_row(ws, col_letter, from_row, to_row):
     """
     Copy only the cell value from from_row to to_row for a given column letter.
-    Styles/colors are not copied so new rows remain visually "clean".
+    Styles/colors are not copied so new rows remain visually clean.
     """
     src = ws[f"{col_letter}{from_row}"]
     dst = ws[f"{col_letter}{to_row}"]
@@ -299,7 +317,7 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
     col_total_amt  = "AP"  # Total Amt
 
     # Columns that must preserve default value from row 10 (includes AH)
-    # T (Credit Reason) and V (skip workflow) removidas para ficarem em branco
+    # T (Credit Reason) and V (skip workflow) removed to keep them blank
     preserve_letters = ["X", "AH", "AI", "AJ", "AK", "AQ", "AR", "AS"]
 
     # 4) Insert rows starting at row 11 (row 10 = template defaults)
@@ -469,7 +487,7 @@ def main():
     df_coa_match["CURRENCY_CODE"] = df_coa_match["CURRENCY_CODE"].astype(str).str.strip()
     df_coa_match["receipt_amount"] = df_coa_match["LOCAL_RECEIPT_AMOUNT"].round(2)
 
-    # Payment date from column T (20ª coluna), se existir
+    # Payment date from column T (20th column), if it exists
     if df_coa.shape[1] > 19:
         payment_raw = df_coa.iloc[:, 19]
         df_coa_match["PAYMENT_DATE"] = pd.to_datetime(payment_raw, errors="coerce")
@@ -477,8 +495,15 @@ def main():
         df_coa_match["PAYMENT_DATE"] = pd.NaT
 
     # ========= WO MATCHES (SUMIFS by TRANSACTION NUMBER) + CSV =========
-    req_wo = ["Transaction Number", "Transaction Type", "Transaction Date",
-              "Account Number", "Entered Amount", "Entered Currency"]
+    req_wo = [
+        "Transaction Number",
+        "Transaction Type",
+        "Transaction Date",
+        "Account Number",
+        "Entered Amount",
+        "Entered Currency",
+        "Reason Code",
+    ]
     miss_wo = [c for c in req_wo if c not in df_wo.columns]
     if miss_wo:
         print(f"Missing columns in WO: {miss_wo}. Skipping WO matches / CSV.")
@@ -493,14 +518,17 @@ def main():
         df_wo_m["Entered Currency"] = df_wo_m["Entered Currency"].astype(str).str.strip()
         df_wo_m["Transaction Type"] = df_wo_m["Transaction Type"].astype(str)
 
-        # Exclude any TRANSACTION NUMBER having TYPE containing 'GROUP'
-        group_trx = df_wo_m.loc[
-            df_wo_m["Transaction Type"].str.contains("GROUP", case=False, na=False),
-            "Transaction Number",
-        ].unique()
-        if len(group_trx) > 0:
-            print(f"Excluding {len(group_trx)} Transaction Number(s) with Transaction Type containing 'GROUP' from WO matching.")
-            df_wo_m = df_wo_m[~df_wo_m["Transaction Number"].isin(group_trx)].copy()
+        # Exclude Transaction Numbers whose Transaction Type contains 'GROUP' but NOT 'XLR'
+        mask_group = df_wo_m["Transaction Type"].str.contains("GROUP", case=False, na=False)
+        mask_xlr = df_wo_m["Transaction Type"].str.contains("XLR", case=False, na=False)
+        group_only_trx = df_wo_m.loc[mask_group & ~mask_xlr, "Transaction Number"].unique()
+
+        if len(group_only_trx) > 0:
+            print(
+                f"Excluding {len(group_only_trx)} Transaction Number(s) whose "
+                "Transaction Type contains 'GROUP' but not 'XLR' from WO matching."
+            )
+            df_wo_m = df_wo_m[~df_wo_m["Transaction Number"].isin(group_only_trx)].copy()
 
         # SUMIFS by (Account Number, Transaction Number, Currency)
         df_wo_sum_trx = (
@@ -574,6 +602,7 @@ def main():
                 "Entered Currency",
                 "Transaction Type",
                 "Account Number",
+                "Reason Code",
             ]
             df_matches_agg = (
                 matches_wo
@@ -585,6 +614,7 @@ def main():
                     "RECEIPT_STATUS": "first",
                     "Transaction Date": "first",
                     "PAYMENT_DATE": "first",
+                    "Reason Code": "first",
                 })
             )
 
@@ -593,6 +623,12 @@ def main():
                 df_matches_agg["Days Between Payment and Invoice"] = (
                     (df_matches_agg["PAYMENT_DATE"] - df_matches_agg["Transaction Date"]).dt.days
                 )
+                # Split negative days
+                neg_mask = df_matches_agg["Days Between Payment and Invoice"] < 0
+                df_negative_days = df_matches_agg[neg_mask].copy()
+                df_matches_agg = df_matches_agg[~neg_mask].copy()
+            else:
+                df_negative_days = pd.DataFrame()
 
             df_matches = df_matches_agg.rename(columns={
                 "receipt_amount": "LOCAL_RECEIPT_AMOUNT",
@@ -624,7 +660,7 @@ def main():
                 cond_unknown = merged_unknown["receipt_amount"] == (-merged_unknown["sum_amount"])
                 df_unknown_matches = merged_unknown.loc[cond_unknown].drop_duplicates()
 
-            # Write Matches, NL review and Unknown OID Matches back into COA
+            # Write Matches, NL review, Unknown OID Matches and Negative Days back into COA
             with pd.ExcelWriter(coa_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
                 df_matches.to_excel(w, sheet_name="Matches", index=False)
                 print(f"Sheet 'Matches' created with {len(df_matches)} rows (1 row per RECEIPT_NUMBER).")
@@ -637,18 +673,28 @@ def main():
                     df_unknown_matches.to_excel(w, sheet_name="Unknown OID Matches", index=False)
                     print(f"Sheet 'Unknown OID Matches' created with {len(df_unknown_matches)} rows.")
 
+                if not df_negative_days.empty:
+                    df_negative_days_renamed = df_negative_days.rename(columns={
+                        "receipt_amount": "LOCAL_RECEIPT_AMOUNT",
+                        "sum_amount": "WO_SUMIFS",
+                        "CURRENCY_CODE": "Receipt Currency Code",
+                        "Entered Currency": "WO Currency",
+                    })
+                    df_negative_days_renamed.to_excel(w, sheet_name="Negative Days", index=False)
+                    print(f"Sheet 'Negative Days' created with {len(df_negative_days_renamed)} rows (payment < invoice date).")
+
             # Dates for file naming and comments
             today = date.today()
             today_csv_name = today.strftime("%m%d%Y")
             today_comment = today.strftime("%m/%d/%Y")
 
-            # Separate file for Cash (espelha Matches; mantém todas as linhas)
+            # Separate file for Cash (mirrors Matches; keeps all rows)
             cash_xlsx_name = f"COAvsWO_Cash_{today_csv_name}.xlsx"
             cash_xlsx_path = OUTPUT_FOLDER / cash_xlsx_name
             df_matches.to_excel(cash_xlsx_path, index=False)
             print(f"Cash file generated with {len(df_matches)} rows at:\n{cash_xlsx_path}")
 
-            # COAvsWO CSV from aggregated matches, somente DIR
+            # COAvsWO CSV from aggregated matches, DIR only
             df_matches_agg_dir = df_matches_agg[dir_mask.values].copy()
 
             if df_matches_agg_dir.empty:
@@ -665,10 +711,17 @@ def main():
                 df_csv["Adjustment Type"] = "Line"
                 # positive value (invert sign of Entered Amount)
                 df_csv["Amount to be Adjusted"] = (-df_matches_agg_dir["Entered Amount"]).round(2)
-                df_csv["Reason"] = "Uneconomical to Collect"
+                # Normalized Reason from WO Reason Code
+                df_csv["Reason"] = df_matches_agg_dir["Reason Code"].apply(normalize_reason)
                 df_csv["Comments"] = "COA vs WO " + today_comment
                 df_csv["GL Date"] = ""
                 df_csv["Adjust Date"] = ""
+
+                # Drop any rows without a Transaction Number (defensive against stray blank rows)
+                df_csv = df_csv[
+                    df_csv["Transaction Number"].notna()
+                    & (df_csv["Transaction Number"].astype(str).str.strip() != "")
+                ].reset_index(drop=True)
 
                 csv_name = f"COAvsWO{today_csv_name}.csv"
                 csv_path = OUTPUT_FOLDER / csv_name
