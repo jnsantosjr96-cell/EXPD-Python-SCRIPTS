@@ -607,7 +607,7 @@ def extract_date_positional(words: List[Dict], anchors: List[Dict]) -> Optional[
     for a in anchors:
         same = collect_tokens_on_same_line_right(words, a)
         if same:
-            txt = join_tokens(same)
+ txt = join_tokens(same)
             m = DATE_TOKEN_REGEX.search(txt)
             if m and is_valid_date_token(m.group(1)):
                 return m.group(1)
@@ -790,13 +790,25 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                 if val:
                     results["Country"] = val
 
+        # ------- Fallback por regex para campos restantes -------
         for f in FIELDS:
             col = f["col"]
             if results.get(col):
                 continue
-            # IMPORTANT: do NOT try to infer State/Province via generic regex;
-            # we only trust the positional extraction for State/Province.
+
+            # Fallback controlado para State/Province:
+            # só usa r"state\s*/\s*province" e r"state\s*province", para não
+            # inferir de linhas tipo "City, State, Postal Code".
             if col == "State/Province":
+                found = None
+                specific_labels = [r"state\s*/\s*province", r"state\s*province"]
+                for lab in specific_labels:
+                    found = try_same_line_block(full_text, lab)
+                    if not found:
+                        found = try_next_line_block(full_text, lab, BARRIER_LABELS)
+                    if found:
+                        break
+                results[col] = found
                 continue
 
             found = None
@@ -822,6 +834,7 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                 if m:
                     found = m.group(0)
             results[col] = found
+        # ------- fim fallback FIELDS -------
 
         if results["Currency"]:
             cur0 = results["Currency"].upper().strip()
@@ -857,7 +870,11 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
 
         # Special case: Hong Kong should not have short numeric "CEP" like 852
         country_raw = (results.get("Country") or "").strip()
-        iso2_country = to_iso2(country_raw) or ""
+        iso2_country = None
+        try:
+            iso2_country = to_iso2(country_raw) or ""
+        except Exception:
+            iso2_country = ""
         if iso2_country.upper() == "HK":
             p_val = results.get("Postal Code")
             if p_val and re.fullmatch(r"\d{1,4}", str(p_val).strip()):
@@ -896,7 +913,11 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
         if not results.get("Currency"):
             country_raw = (results.get("Country") or "").strip()
             country_norm = country_raw.upper()
-            iso2_country = to_iso2(country_raw) or ""
+            iso2_country = None
+            try:
+                iso2_country = to_iso2(country_raw) or ""
+            except Exception:
+                iso2_country = ""
             cur_final = (
                 DEFAULT_CURRENCY_BY_COUNTRY.get(country_norm)
                 or DEFAULT_CURRENCY_BY_COUNTRY.get(iso2_country.upper(), None)
@@ -930,14 +951,30 @@ def to_iso2(country_name: Optional[str]) -> Optional[str]:
     if not country_name:
         return None
     v = str(country_name).strip()
+
+    # Normalização forte para tratar casos como Türkiye/Turkiye/Turkey
+    v_norm = unidecode(v).strip().upper()
+
+    MANUAL_ISO2 = {
+        "TURKEY": "TR",
+        "TURKIYE": "TR",
+    }
+    if v_norm in MANUAL_ISO2:
+        return MANUAL_ISO2[v_norm]
+
+    # Se já for código de 2 letras (ex.: "TR")
     if re.fullmatch(r"[A-Za-z]{2}", v):
         return v.upper()
+
     if pycountry:
-        try:
-            c = pycountry.countries.lookup(v)
-            return getattr(c, "alpha_2", None)
-        except Exception:
-            return None
+        # Tenta primeiro com a forma normalizada, depois com o valor original
+        for cand in (v_norm, v):
+            try:
+                c = pycountry.countries.lookup(cand)
+                return getattr(c, "alpha_2", None)
+            except Exception:
+                continue
+        return None
     return None
 
 def _norm_header_key(s: str) -> str:
@@ -974,6 +1011,7 @@ HEADER_SYNONYMS = {
         "VAT_NUMBER",
         "TAXID",
         "TAX_ID",
+        "TAX_REG_NUM",  # alias p/ cabeçalho Tax_reg_num
     },
     "SITE_PURPOSE": {"SITEPURPOSE", "SITE_PURP", "SITE_PURPOSE_"},
     "BILL_TO": {"BILLTO", "SITE_USE_CODE", "SITE_USE", "SITEUSECODE"},
@@ -1220,6 +1258,7 @@ def inject_into_webadi(
                 if val not in (None, "", " "):
                     ws.cell(current, col_idx).value = val
 
+        # Preencher State/Province no WebADI:
         if stateprov and isinstance(stateprov, str):
             if iso2 == "CA" and col_province:
                 ws.cell(current, col_province).value = stateprov
@@ -1239,7 +1278,12 @@ LEGAL_NAME_CLEAN_RE = re.compile(r"[^A-Za-z0-9 ]+")
 def add_country_iso2_column(df: pd.DataFrame) -> pd.DataFrame:
     if "Country" not in df.columns:
         return df
-    iso2_values = [to_iso2(v) for v in df["Country"]]
+    iso2_values = []
+    for v in df["Country"]:
+        try:
+            iso2_values.append(to_iso2(v))
+        except Exception:
+            iso2_values.append(None)
     insert_pos = list(df.columns).index("Country") + 1
     df.insert(loc=insert_pos, column="Country ISO2", value=iso2_values)
     return df
