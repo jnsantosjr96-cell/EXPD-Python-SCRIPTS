@@ -530,6 +530,69 @@ def try_next_line_block(
         return cand
     return None
 
+def try_next_line_block(
+    text: str, label_regex: str, all_label_variants: List[str]
+) -> Optional[str]:
+    label_only = re.compile(
+        LABEL_ONLY_PATTERN_TMPL.format(label=label_regex),
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    m = label_only.search(text)
+    if not m:
+        return None
+    tail = text[m.end():]
+    start_of_label = re.compile(
+        r"(?im)^\s*(?:" + "|".join(all_label_variants) + r")\s*:\b"
+    )
+    for ln in tail.splitlines():
+        cand = clean_extracted_value(ln)
+        if not cand:
+            continue
+        if start_of_label.match(cand):
+            return None
+        if (
+            HEADER_NOISE.search(cand)
+            or SIGNATURE_NOISE.match(cand)
+            or contains_date_like(cand)
+        ):
+            continue
+        return cand
+    return None
+
+def try_next_line_block_state(text: str, label_regex: str) -> Optional[str]:
+    """
+    Fallback específico para State/Province:
+    - Se logo após o label vier outra linha que já é um label (Postal Code, Tax Registration Number,
+      Signature, etc.), consideramos o campo vazio e NÃO descemos até linhas de assinatura.
+    """
+    label_only = re.compile(
+        LABEL_ONLY_PATTERN_TMPL.format(label=label_regex),
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    m = label_only.search(text)
+    if not m:
+        return None
+
+    tail = text[m.end():]
+
+    for ln in tail.splitlines():
+        # Se a linha já começa com outro label conhecido, paramos imediatamente
+        if LABEL_LINE_RE.match(ln):
+            return None
+
+        cand = clean_extracted_value(ln)
+        if not cand:
+            continue
+        if (
+            HEADER_NOISE.search(cand)
+            or SIGNATURE_NOISE.match(cand)
+            or contains_date_like(cand)
+        ):
+            continue
+        return cand
+
+    return None
+
 def words_from_page(page) -> List[Dict]:
     return page.extract_words(
         x_tolerance=3,
@@ -829,9 +892,11 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                 found = None
                 specific_labels = [r"state\s*/\s*province", r"state\s*province"]
                 for lab in specific_labels:
+                    # 1) tenta na mesma linha do label
                     found = try_same_line_block(full_text, lab)
+                    # 2) se não achar, usa o fallback ESPECÍFICO de State/Province
                     if not found:
-                        found = try_next_line_block(full_text, lab, BARRIER_LABELS)
+                        found = try_next_line_block_state(full_text, lab)
                     if found:
                         break
                 results[col] = found
@@ -1165,273 +1230,6 @@ def _is_blank(val) -> bool:
         return bool(_pd.isna(val))
     except Exception:
         return False
-
-def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
-    """
-    Converte a linguagem (string) em código ISO 639-1 de 2 letras (EN, PT, ES, ...).
-    - Usa pycountry.languages como fonte principal (padrão internacional).
-    - Aceita nomes ('English', 'Portuguese (Brazil)'), códigos com região ('en-US', 'pt_BR').
-    - Se não reconhecer com segurança, retorna None (fica em branco no WEBADI).
-    """
-    if val is None:
-        return None
-
-    s_raw = str(val).strip()
-    if not s_raw:
-        return None
-
-    # Normaliza acentos e caixa
-    s = unidecode(s_raw).strip()
-
-    # 1) Já vier um código tipo "en", "EN", "pt", etc.
-    if len(s) == 2 and s.isalpha():
-        return s.upper()
-
-    # 2) Pega prefixo de 2 letras antes de "-" ou "_" (ex: "en-US", "pt_BR", "en (US)")
-    m = re.match(r"\s*([A-Za-z]{2})\b", s)
-    if m:
-        return m.group(1).upper()
-
-    # 3) Tenta lookup pelo pycountry (nome, alpha_2, alpha_3, bibliographic, etc.)
-    if pycountry is not None:
-        try:
-            lang = pycountry.languages.lookup(s.lower())
-            alpha2 = getattr(lang, "alpha_2", None)
-            if alpha2 and len(alpha2) == 2:
-                return alpha2.upper()
-        except Exception:
-            pass
-
-    # 4) Fallback manual para nomes comuns (em inglês/português/espanhol)
-    s_low = s.lower()
-    if "english" in s_low:
-        return "EN"
-    if "portugu" in s_low:
-        return "PT"
-    if "spanish" in s_low or "espanol" in s_low or "espanhol" in s_low:
-        return "ES"
-    if "french" in s_low or "frances" in s_low:
-        return "FR"
-    if "german" in s_low or "alemao" in s_low or "aleman" in s_low:
-        return "DE"
-    if "italian" in s_low or "italiano" in s_low:
-        return "IT"
-    if "dutch" in s_low or "holandes" in s_low:
-        return "NL"
-    if "japanese" in s_low or "japones" in s_low:
-        return "JA"
-    if "chinese" in s_low or "mandarin" in s_low:
-        return "ZH"
-    if "korean" in s_low:
-        return "KO"
-    if "russian" in s_low:
-        return "RU"
-
-    # Se não conseguiu mapear com segurança, deixa em branco no WEBADI
-    return None
-
-def inject_into_webadi(
-    template_path: Path,
-    out_path: Optional[Path],
-    df: pd.DataFrame,
-    mode: str = "replace",
-    sheet_name: str = WEBADI_SHEET_DEFAULT,
-    header_start_row: int = 5,
-    debug: bool = False,
-    unprotect: bool = True,
-):
-    if not template_path.exists():
-        raise FileNotFoundError(f"WEBADI template not found: {template_path}")
-
-    wb = load_workbook(
-        str(template_path),
-        keep_vba=True,
-        data_only=False,
-        keep_links=True,
-    )
-
-    if unprotect:
-        if debug:
-            print("[DEBUG] webadi_unprotect=True: unprotecting workbook/sheets.")
-        unprotect_workbook_and_sheets(wb, debug=debug)
-    else:
-        if debug:
-            print("[DEBUG] webadi_unprotect=False: keeping protections.")
-
-    if sheet_name not in wb.sheetnames:
-        raise RuntimeError(f"Sheet '{sheet_name}' not found in template.")
-    ws = wb[sheet_name]
-
-    try:
-        d3 = ws["D3"].value
-        if isinstance(d3, str) and d3.strip().lower().replace(" ", "") == "*text":
-            today_str = datetime.now().strftime("%m%d%Y")
-            ws["E3"].value = f"OC {today_str}"
-            if debug:
-                print(f"[DEBUG] E3 (BATCH_NAME) set to 'OC {today_str}'")
-    except Exception as e:
-        if debug:
-            print(f"[DEBUG] Failed to update BATCH_NAME in E3: {e}")
-
-    header_row, header_map = find_header_row(
-        ws, start_at_row=header_start_row, debug=debug
-    )
-
-    wanted = {
-        "HOTEL_ID": "Expedia ID",
-        "CUSTOMER_NAME": "Hotel Name",
-        "ADDRESS_LINE_1": "Address Line 1",
-        "CITY": "City",
-        "POSTAL_CODE": "Postal Code",
-        "COUNTRY": "Country",
-        "BILLING_CURRENCY": "Currency",
-        "FIRST_NAME": "First Name",
-        "LAST_NAME": "Last Name",
-        "EMAIL_ADDRESS": "Email Address",
-        "TAX_REG_NUMBER": "Tax Registration Number",
-        "EFFECTIVE_DATE": "Effective Date of Change",
-        "PREFERRED_LANGUAGE": "Preferred Language",
-    }
-
-    col_state = header_map.get("STATE")
-    col_province = header_map.get("PROVINCE")
-    col_bill_to = header_map.get("BILL_TO")
-
-    if not col_bill_to:
-        col_bill_to = column_index_from_string("Q")
-        if debug:
-            print(
-                "[DEBUG] BILL_TO column not found by header; "
-                "using fallback column Q."
-            )
-
-    col_site_purpose = header_map.get("SITE_PURPOSE")
-
-    key_col = header_map.get("HOTEL_ID") or header_map.get("CUSTOMER_NAME")
-    if not key_col:
-        raise RuntimeError(
-            "Could not find key columns (HOTEL_ID/CUSTOMER_NAME) in WebADI header."
-        )
-
-    if mode.lower() == "replace":
-        last = ws.max_row
-        for _ in range(header_row + 1, last + 1):
-            ws.delete_rows(header_row + 1)
-        base_row = header_row
-        if debug:
-            print(
-                f"[DEBUG] Replace mode: cleared rows after header row {header_row}."
-            )
-    else:
-        base_row = last_data_row(ws, header_row, key_col)
-        if debug:
-            print(
-                f"[DEBUG] Append mode: last data row detected = {base_row}."
-            )
-
-    current = base_row
-    for _, rec in df.iterrows():
-        iso2 = to_iso2(rec.get("Country"))
-        stateprov = rec.get("State/Province")
-
-        current += 1
-        src_row = base_row if base_row > header_row else header_row + 1
-        clone_row(ws, src_row, current)
-
-        # Sempre sobrescreve BILL_TO e SITE_PURPOSE
-        if col_bill_to:
-            ws.cell(current, col_bill_to).value = "BILL_TO"
-        if col_site_purpose:
-            ws.cell(current, col_site_purpose).value = "BILL_TO"
-
-        # Zera sempre STATE/PROVINCE nas linhas novas para não herdar lixo
-        if col_state:
-            ws.cell(current, col_state).value = None
-        if col_province:
-            ws.cell(current, col_province).value = None
-
-        for webadi_col, script_col in wanted.items():
-            col_idx = header_map.get(webadi_col)
-            if not col_idx:
-                continue
-            val = rec.get(script_col)
-
-            # País (ISO2 ou nome). Se não houver valor, limpa a célula.
-            if webadi_col == "COUNTRY":
-                if _is_blank(val):
-                    ws.cell(current, col_idx).value = None
-                else:
-                    v2 = to_iso2(val) or val
-                    ws.cell(current, col_idx).value = v2
-
-            # Moeda: 3 letras ou, se não tiver valor, limpa.
-            elif webadi_col == "BILLING_CURRENCY":
-                if _is_blank(val):
-                    ws.cell(current, col_idx).value = None
-                else:
-                    if isinstance(val, str) and re.fullmatch(r"[A-Za-z]{3}", val.strip()):
-                        ws.cell(current, col_idx).value = val.strip().upper()
-                    else:
-                        ws.cell(current, col_idx).value = val
-
-            # Preferred Language: converte para código de 2 letras.
-            elif webadi_col == "PREFERRED_LANGUAGE":
-                if _is_blank(val):
-                    ws.cell(current, col_idx).value = None
-                else:
-                    code = normalize_language_to_code(val)
-                    ws.cell(current, col_idx).value = code if code else None
-
-            # Demais campos (inclui TAX_REG_NUMBER, ADDRESS_LINE_1, etc.)
-            else:
-                if _is_blank(val):
-                    ws.cell(current, col_idx).value = None
-                else:
-                    ws.cell(current, col_idx).value = val
-
-        # Preencher State/Province no WebADI, após limpar as colunas acima
-        if not _is_blank(stateprov) and isinstance(stateprov, str):
-            if iso2 == "CA" and col_province:
-                ws.cell(current, col_province).value = stateprov
-            elif iso2 != "CA" and col_state:
-                ws.cell(current, col_state).value = stateprov
-
-    if not out_path:
-        out_path = template_path
-
-    wb.save(str(out_path))
-    print(f"[OK] WEBADI filled: {out_path}")
-
-# -------------------- ORACLE ENRICH / HELPER FUNCS --------------------
-
-LEGAL_NAME_CLEAN_RE = re.compile(r"[^A-Za-z0-9 ]+")
-
-def add_country_iso2_column(df: pd.DataFrame) -> pd.DataFrame:
-    if "Country" not in df.columns:
-        return df
-    iso2_values = []
-    for v in df["Country"]:
-        try:
-            iso2_values.append(to_iso2(v))
-        except Exception:
-            iso2_values.append(None)
-    insert_pos = list(df.columns).index("Country") + 1
-    df.insert(loc=insert_pos, column="Country ISO2", value=iso2_values)
-    return df
-
-def sanitize_legal_name_column(df: pd.DataFrame) -> pd.DataFrame:
-    if "Legal Name" not in df.columns:
-        return df
-
-    def _clean_ln(x):
-        if x in (None, "", " "):
-            return x
-        x = unidecode(str(x))
-        x = LEGAL_NAME_CLEAN_RE.sub("", x)
-        return x.strip()
-
-    df["Legal Name"] = df["Legal Name"].astype(str).apply(_clean_ln)
-    return df
 
 def format_comment_from_filename(fn: str) -> str:
     if not fn:
@@ -1823,6 +1621,273 @@ def main():
         print(
             "[INFO] WEBADI step not executed (no --webadi_template and no default template found)."
         )
+
+def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
+    """
+    Converte a linguagem (string) em código ISO 639-1 de 2 letras (EN, PT, ES, ...).
+    - Usa pycountry.languages como fonte principal (padrão internacional).
+    - Aceita nomes ('English', 'Portuguese (Brazil)'), códigos com região ('en-US', 'pt_BR').
+    - Se não reconhecer com segurança, retorna None (fica em branco no WEBADI).
+    """
+    if val is None:
+        return None
+
+    s_raw = str(val).strip()
+    if not s_raw:
+        return None
+
+    # Normaliza acentos e caixa
+    s = unidecode(s_raw).strip()
+
+    # 1) Já vier um código tipo "en", "EN", "pt", etc.
+    if len(s) == 2 and s.isalpha():
+        return s.upper()
+
+    # 2) Pega prefixo de 2 letras antes de "-" ou "_" (ex: "en-US", "pt_BR", "en (US)")
+    m = re.match(r"\s*([A-Za-z]{2})\b", s)
+    if m:
+        return m.group(1).upper()
+
+    # 3) Tenta lookup pelo pycountry (nome, alpha_2, alpha_3, bibliographic, etc.)
+    if pycountry is not None:
+        try:
+            lang = pycountry.languages.lookup(s.lower())
+            alpha2 = getattr(lang, "alpha_2", None)
+            if alpha2 and len(alpha2) == 2:
+                return alpha2.upper()
+        except Exception:
+            pass
+
+    # 4) Fallback manual para nomes comuns (em inglês/português/espanhol)
+    s_low = s.lower()
+    if "english" in s_low:
+        return "EN"
+    if "portugu" in s_low:
+        return "PT"
+    if "spanish" in s_low or "espanol" in s_low or "espanhol" in s_low:
+        return "ES"
+    if "french" in s_low or "frances" in s_low:
+        return "FR"
+    if "german" in s_low or "alemao" in s_low or "aleman" in s_low:
+        return "DE"
+    if "italian" in s_low or "italiano" in s_low:
+        return "IT"
+    if "dutch" in s_low or "holandes" in s_low:
+        return "NL"
+    if "japanese" in s_low or "japones" in s_low:
+        return "JA"
+    if "chinese" in s_low or "mandarin" in s_low:
+        return "ZH"
+    if "korean" in s_low:
+        return "KO"
+    if "russian" in s_low:
+        return "RU"
+
+    # Se não conseguiu mapear com segurança, deixa em branco no WEBADI
+    return None
+
+# -------------------- ORACLE ENRICH / HELPER FUNCS --------------------
+
+def inject_into_webadi(
+    template_path: Path,
+    out_path: Optional[Path],
+    df: pd.DataFrame,
+    mode: str = "replace",
+    sheet_name: str = WEBADI_SHEET_DEFAULT,
+    header_start_row: int = 5,
+    debug: bool = False,
+    unprotect: bool = True,
+):
+    if not template_path.exists():
+        raise FileNotFoundError(f"WEBADI template not found: {template_path}")
+
+    wb = load_workbook(
+        str(template_path),
+        keep_vba=True,
+        data_only=False,
+        keep_links=True,
+    )
+
+    if unprotect:
+        if debug:
+            print("[DEBUG] webadi_unprotect=True: unprotecting workbook/sheets.")
+        unprotect_workbook_and_sheets(wb, debug=debug)
+    else:
+        if debug:
+            print("[DEBUG] webadi_unprotect=False: keeping protections.")
+
+    if sheet_name not in wb.sheetnames:
+        raise RuntimeError(f"Sheet '{sheet_name}' not found in template.")
+    ws = wb[sheet_name]
+
+    try:
+        d3 = ws["D3"].value
+        if isinstance(d3, str) and d3.strip().lower().replace(" ", "") == "*text":
+            today_str = datetime.now().strftime("%m%d%Y")
+            ws["E3"].value = f"OC {today_str}"
+            if debug:
+                print(f"[DEBUG] E3 (BATCH_NAME) set to 'OC {today_str}'")
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] Failed to update BATCH_NAME in E3: {e}")
+
+    header_row, header_map = find_header_row(
+        ws, start_at_row=header_start_row, debug=debug
+    )
+
+    wanted = {
+        "HOTEL_ID": "Expedia ID",
+        "CUSTOMER_NAME": "Hotel Name",
+        "ADDRESS_LINE_1": "Address Line 1",
+        "CITY": "City",
+        "POSTAL_CODE": "Postal Code",
+        "COUNTRY": "Country",
+        "BILLING_CURRENCY": "Currency",
+        "FIRST_NAME": "First Name",
+        "LAST_NAME": "Last Name",
+        "EMAIL_ADDRESS": "Email Address",
+        "TAX_REG_NUMBER": "Tax Registration Number",
+        "EFFECTIVE_DATE": "Effective Date of Change",
+        "PREFERRED_LANGUAGE": "Preferred Language",
+    }
+
+    col_state = header_map.get("STATE")
+    col_province = header_map.get("PROVINCE")
+    col_bill_to = header_map.get("BILL_TO")
+
+    if not col_bill_to:
+        col_bill_to = column_index_from_string("Q")
+        if debug:
+            print(
+                "[DEBUG] BILL_TO column not found by header; "
+                "using fallback column Q."
+            )
+
+    col_site_purpose = header_map.get("SITE_PURPOSE")
+
+    key_col = header_map.get("HOTEL_ID") or header_map.get("CUSTOMER_NAME")
+    if not key_col:
+        raise RuntimeError(
+            "Could not find key columns (HOTEL_ID/CUSTOMER_NAME) in WebADI header."
+        )
+
+    if mode.lower() == "replace":
+        last = ws.max_row
+        for _ in range(header_row + 1, last + 1):
+            ws.delete_rows(header_row + 1)
+        base_row = header_row
+        if debug:
+            print(
+                f"[DEBUG] Replace mode: cleared rows after header row {header_row}."
+            )
+    else:
+        base_row = last_data_row(ws, header_row, key_col)
+        if debug:
+            print(
+                f"[DEBUG] Append mode: last data row detected = {base_row}."
+            )
+
+    current = base_row
+    for _, rec in df.iterrows():
+        iso2 = to_iso2(rec.get("Country"))
+        stateprov = rec.get("State/Province")
+
+        current += 1
+        src_row = base_row if base_row > header_row else header_row + 1
+        clone_row(ws, src_row, current)
+
+        # Sempre sobrescreve BILL_TO e SITE_PURPOSE
+        if col_bill_to:
+            ws.cell(current, col_bill_to).value = "BILL_TO"
+        if col_site_purpose:
+            ws.cell(current, col_site_purpose).value = "BILL_TO"
+
+        # Zera sempre STATE/PROVINCE nas linhas novas para não herdar lixo
+        if col_state:
+            ws.cell(current, col_state).value = None
+        if col_province:
+            ws.cell(current, col_province).value = None
+
+        for webadi_col, script_col in wanted.items():
+            col_idx = header_map.get(webadi_col)
+            if not col_idx:
+                continue
+            val = rec.get(script_col)
+
+            # País (ISO2 ou nome). Se não houver valor, limpa a célula.
+            if webadi_col == "COUNTRY":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    v2 = to_iso2(val) or val
+                    ws.cell(current, col_idx).value = v2
+
+            # Moeda: 3 letras ou, se não tiver valor, limpa.
+            elif webadi_col == "BILLING_CURRENCY":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    if isinstance(val, str) and re.fullmatch(r"[A-Za-z]{3}", val.strip()):
+                        ws.cell(current, col_idx).value = val.strip().upper()
+                    else:
+                        ws.cell(current, col_idx).value = val
+
+            # Preferred Language: converte para código de 2 letras.
+            elif webadi_col == "PREFERRED_LANGUAGE":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    code = normalize_language_to_code(val)
+                    ws.cell(current, col_idx).value = code if code else None
+
+            # Demais campos (inclui TAX_REG_NUMBER, ADDRESS_LINE_1, etc.)
+            else:
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    ws.cell(current, col_idx).value = val
+
+        # Preencher State/Province no WebADI, após limpar as colunas acima
+        if not _is_blank(stateprov) and isinstance(stateprov, str):
+            if iso2 == "CA" and col_province:
+                ws.cell(current, col_province).value = stateprov
+            elif iso2 != "CA" and col_state:
+                ws.cell(current, col_state).value = stateprov
+
+    if not out_path:
+        out_path = template_path
+
+    wb.save(str(out_path))
+    print(f"[OK] WEBADI filled: {out_path}")
+
+LEGAL_NAME_CLEAN_RE = re.compile(r"[^A-Za-z0-9 ]+")
+
+def add_country_iso2_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "Country" not in df.columns:
+        return df
+    iso2_values = []
+    for v in df["Country"]:
+        try:
+            iso2_values.append(to_iso2(v))
+        except Exception:
+            iso2_values.append(None)
+    insert_pos = list(df.columns).index("Country") + 1
+    df.insert(loc=insert_pos, column="Country ISO2", value=iso2_values)
+    return df
+
+def sanitize_legal_name_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "Legal Name" not in df.columns:
+        return df
+
+    def _clean_ln(x):
+        if x in (None, "", " "):
+            return x
+        x = unidecode(str(x))
+        x = LEGAL_NAME_CLEAN_RE.sub("", x)
+        return x.strip()
+
+    df["Legal Name"] = df["Legal Name"].astype(str).apply(_clean_ln)
+    return df
 
 if __name__ == "__main__":
     main()
