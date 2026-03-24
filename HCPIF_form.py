@@ -607,7 +607,7 @@ def extract_date_positional(words: List[Dict], anchors: List[Dict]) -> Optional[
     for a in anchors:
         same = collect_tokens_on_same_line_right(words, a)
         if same:
- txt = join_tokens(same)
+            txt = join_tokens(same)
             m = DATE_TOKEN_REGEX.search(txt)
             if m and is_valid_date_token(m.group(1)):
                 return m.group(1)
@@ -709,6 +709,34 @@ def ocr_extract_full_text(pdf_path: Path) -> str:
             continue
     return "\n".join(texts)
 
+def strip_state_if_person_name(results: Dict[str, Optional[str]]) -> None:
+    """
+    Se State/Province for igual ao First Name, Last Name ou "First Last", zera o campo.
+    Evita casos em que state vazio puxa nome de contato.
+    """
+    s = results.get("State/Province")
+    if not s:
+        return
+    fn = results.get("First Name")
+    ln = results.get("Last Name")
+    if not fn and not ln:
+        return
+
+    def norm(x):
+        return unidecode(str(x)).strip().lower()
+
+    s_n = norm(s)
+    candidates = set()
+    if fn:
+        candidates.add(norm(fn))
+    if ln:
+        candidates.add(norm(ln))
+    if fn and ln:
+        candidates.add((norm(fn) + " " + norm(ln)).strip())
+
+    if s_n in candidates:
+        results["State/Province"] = None
+
 def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
     results = {f["col"]: None for f in FIELDS}
     with pdfplumber.open(str(pdf_path)) as pdf:
@@ -797,8 +825,6 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                 continue
 
             # Fallback controlado para State/Province:
-            # só usa r"state\s*/\s*province" e r"state\s*province", para não
-            # inferir de linhas tipo "City, State, Postal Code".
             if col == "State/Province":
                 found = None
                 specific_labels = [r"state\s*/\s*province", r"state\s*province"]
@@ -840,8 +866,10 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
             cur0 = results["Currency"].upper().strip()
             results["Currency"] = cur0 if re.fullmatch(r"[A-Z]{3}", cur0) else None
 
+        # Limpa state se for igual a nome de contato
+        strip_state_if_person_name(results)
+
         # Only use sanitize_state_and_postal to handle obvious swaps;
-        # state inference from City/State/Postal has been removed.
         results["State/Province"], results["Postal Code"] = sanitize_state_and_postal(
             results.get("State/Province"), results.get("Postal Code")
         )
@@ -1011,7 +1039,7 @@ HEADER_SYNONYMS = {
         "VAT_NUMBER",
         "TAXID",
         "TAX_ID",
-        "TAX_REG_NUM",  # alias p/ cabeçalho Tax_reg_num
+        "TAX_REG_NUM",
     },
     "SITE_PURPOSE": {"SITEPURPOSE", "SITE_PURP", "SITE_PURPOSE_"},
     "BILL_TO": {"BILLTO", "SITE_USE_CODE", "SITE_USE", "SITEUSECODE"},
@@ -1126,6 +1154,82 @@ def unprotect_workbook_and_sheets(wb, debug: bool = False):
             if debug:
                 print(f"[DEBUG] Failed to unprotect sheet {ws.title}: {e}")
 
+def _is_blank(val) -> bool:
+    """True para None, string vazia ou NaN."""
+    if val is None:
+        return True
+    if isinstance(val, str) and val.strip() == "":
+        return True
+    try:
+        import pandas as _pd
+        return bool(_pd.isna(val))
+    except Exception:
+        return False
+
+def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
+    """
+    Converte a linguagem (string) em código ISO 639-1 de 2 letras (EN, PT, ES, ...).
+    - Usa pycountry.languages como fonte principal (padrão internacional).
+    - Aceita nomes ('English', 'Portuguese (Brazil)'), códigos com região ('en-US', 'pt_BR').
+    - Se não reconhecer com segurança, retorna None (fica em branco no WEBADI).
+    """
+    if val is None:
+        return None
+
+    s_raw = str(val).strip()
+    if not s_raw:
+        return None
+
+    # Normaliza acentos e caixa
+    s = unidecode(s_raw).strip()
+
+    # 1) Já vier um código tipo "en", "EN", "pt", etc.
+    if len(s) == 2 and s.isalpha():
+        return s.upper()
+
+    # 2) Pega prefixo de 2 letras antes de "-" ou "_" (ex: "en-US", "pt_BR", "en (US)")
+    m = re.match(r"\s*([A-Za-z]{2})\b", s)
+    if m:
+        return m.group(1).upper()
+
+    # 3) Tenta lookup pelo pycountry (nome, alpha_2, alpha_3, bibliographic, etc.)
+    if pycountry is not None:
+        try:
+            lang = pycountry.languages.lookup(s.lower())
+            alpha2 = getattr(lang, "alpha_2", None)
+            if alpha2 and len(alpha2) == 2:
+                return alpha2.upper()
+        except Exception:
+            pass
+
+    # 4) Fallback manual para nomes comuns (em inglês/português/espanhol)
+    s_low = s.lower()
+    if "english" in s_low:
+        return "EN"
+    if "portugu" in s_low:
+        return "PT"
+    if "spanish" in s_low or "espanol" in s_low or "espanhol" in s_low:
+        return "ES"
+    if "french" in s_low or "frances" in s_low:
+        return "FR"
+    if "german" in s_low or "alemao" in s_low or "aleman" in s_low:
+        return "DE"
+    if "italian" in s_low or "italiano" in s_low:
+        return "IT"
+    if "dutch" in s_low or "holandes" in s_low:
+        return "NL"
+    if "japanese" in s_low or "japones" in s_low:
+        return "JA"
+    if "chinese" in s_low or "mandarin" in s_low:
+        return "ZH"
+    if "korean" in s_low:
+        return "KO"
+    if "russian" in s_low:
+        return "RU"
+
+    # Se não conseguiu mapear com segurança, deixa em branco no WEBADI
+    return None
+
 def inject_into_webadi(
     template_path: Path,
     out_path: Optional[Path],
@@ -1153,7 +1257,6 @@ def inject_into_webadi(
     else:
         if debug:
             print("[DEBUG] webadi_unprotect=False: keeping protections.")
-        # keep protections
 
     if sheet_name not in wb.sheetnames:
         raise RuntimeError(f"Sheet '{sheet_name}' not found in template.")
@@ -1187,6 +1290,7 @@ def inject_into_webadi(
         "EMAIL_ADDRESS": "Email Address",
         "TAX_REG_NUMBER": "Tax Registration Number",
         "EFFECTIVE_DATE": "Effective Date of Change",
+        "PREFERRED_LANGUAGE": "Preferred Language",
     }
 
     col_state = header_map.get("STATE")
@@ -1234,32 +1338,59 @@ def inject_into_webadi(
         src_row = base_row if base_row > header_row else header_row + 1
         clone_row(ws, src_row, current)
 
+        # Sempre sobrescreve BILL_TO e SITE_PURPOSE
         if col_bill_to:
             ws.cell(current, col_bill_to).value = "BILL_TO"
         if col_site_purpose:
             ws.cell(current, col_site_purpose).value = "BILL_TO"
+
+        # Zera sempre STATE/PROVINCE nas linhas novas para não herdar lixo
+        if col_state:
+            ws.cell(current, col_state).value = None
+        if col_province:
+            ws.cell(current, col_province).value = None
 
         for webadi_col, script_col in wanted.items():
             col_idx = header_map.get(webadi_col)
             if not col_idx:
                 continue
             val = rec.get(script_col)
+
+            # País (ISO2 ou nome). Se não houver valor, limpa a célula.
             if webadi_col == "COUNTRY":
-                v2 = to_iso2(val) or val
-                if v2 not in (None, "", " "):
-                    ws.cell(current, col_idx).value = v2
-            elif webadi_col == "BILLING_CURRENCY":
-                if isinstance(val, str) and re.fullmatch(r"[A-Za-z]{3}", val.strip()):
-                    ws.cell(current, col_idx).value = val.strip().upper()
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
                 else:
-                    if val not in (None, "", " "):
+                    v2 = to_iso2(val) or val
+                    ws.cell(current, col_idx).value = v2
+
+            # Moeda: 3 letras ou, se não tiver valor, limpa.
+            elif webadi_col == "BILLING_CURRENCY":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    if isinstance(val, str) and re.fullmatch(r"[A-Za-z]{3}", val.strip()):
+                        ws.cell(current, col_idx).value = val.strip().upper()
+                    else:
                         ws.cell(current, col_idx).value = val
+
+            # Preferred Language: converte para código de 2 letras.
+            elif webadi_col == "PREFERRED_LANGUAGE":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    code = normalize_language_to_code(val)
+                    ws.cell(current, col_idx).value = code if code else None
+
+            # Demais campos (inclui TAX_REG_NUMBER, ADDRESS_LINE_1, etc.)
             else:
-                if val not in (None, "", " "):
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
                     ws.cell(current, col_idx).value = val
 
-        # Preencher State/Province no WebADI:
-        if stateprov and isinstance(stateprov, str):
+        # Preencher State/Province no WebADI, após limpar as colunas acima
+        if not _is_blank(stateprov) and isinstance(stateprov, str):
             if iso2 == "CA" and col_province:
                 ws.cell(current, col_province).value = stateprov
             elif iso2 != "CA" and col_state:
