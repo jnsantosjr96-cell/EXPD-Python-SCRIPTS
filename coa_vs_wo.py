@@ -36,6 +36,11 @@ RELO_DM_TEMPLATE = Path(
     r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Daily activities\COA vs WO Process\4 Non-Lodging Relo CM.xlsm"
 )
 
+# 3 HC Relo Upload DM template (keeps macros)
+HC_DM_TEMPLATE = Path(
+    r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Daily activities\COA vs WO Process\3 HC Relo Upload DM.xlsm"
+)
+
 # ==========================
 # ORACLE CONFIG
 # ==========================
@@ -208,7 +213,7 @@ WHEN HCA.CUSTOMER_CLASS_CODE = 'TA'
     THEN 'Meso Direct Bill'
     WHEN HCA.CUSTOMER_CLASS_CODE = 'SUPPLIER'
             OR HCA.CUSTOMER_CLASS_CODE = 'OTHER'
-            OR CTTA.NAME LIKE '%SO'
+            OR CTTA.NAME LIKE '%SO%'
             THEN 'Supplier Other'
     WHEN HCA.CUSTOMER_CLASS_CODE = 'GROUP PARENT'
     THEN 'Hotel Collect Corporate'
@@ -460,10 +465,6 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
     Generate a .xlsm file from the template, with rows only for RELO MATCHES of type TS_CM_RELO,
     transforming the type into TS_DM_RELO and filling columns as per rules.
     Keeps template macros (keep_vba=True).
-
-    Requirements in df_match_relo:
-    - columns: ['RECEIPT_NUMBER','LOCAL_RECEIPT_AMOUNT','Transaction Number',
-                'Account Number','Transaction Type','WO Currency']
     """
     # 1) Filter only TS_CM_RELO
     if df_match_relo is None or df_match_relo.empty:
@@ -489,7 +490,7 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
             "Transaction Number",
             "Account Number",
             "LOCAL_RECEIPT_AMOUNT",
-            "WO Currency",        # moeda do CM / Match RELO
+            "WO Currency",
         ]]
         .copy()
     )
@@ -534,7 +535,6 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
     today_dt = date.today()
 
     for i, (_, rec) in enumerate(df_src.iterrows(), start=0):
-        receipt_number = rec["RECEIPT_NUMBER"]
         trx_number     = rec["Transaction Number"]
         account_number = rec["Account Number"]
         amount_pos     = float(rec["AMOUNT_POS"])
@@ -583,6 +583,197 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
     wb.save(out_path)
 
     print(f"RELO DM file generated: {out_path}")
+    return out_path
+
+def build_hc_relo_dm_file(df_match_relo: pd.DataFrame, template_path: Path, out_dir: Path):
+    """
+    Generate a .xlsm file from the template '3 HC Relo Upload DM.xlsm', using only
+    MATCH RELO rows whose Transaction Type is different from TS_CM_RELO.
+
+    Mantém a estrutura do arquivo base e escreve o Transaction Type
+    SEMPRE na coluna P (Txn type), sem criar coluna nova.
+    """
+    if df_match_relo is None or df_match_relo.empty:
+        print("Match RELO is empty.\nNo rows to generate 3 HC Relo Upload DM file.")
+        return None
+
+    # Filter only Transaction Type != TS_CM_RELO
+    df_src = (
+        df_match_relo
+        .loc[lambda d: d["Transaction Type"].astype(str).str.upper() != "TS_CM_RELO"]
+        .copy()
+    )
+
+    if df_src.empty:
+        print("No RELO MATCH rows with Transaction Type different from TS_CM_RELO.\nNothing to generate for 3 HC Relo Upload DM.")
+        return None
+
+    # Consolidate 1 row per (receipt, trx, account)
+    df_src = (
+        df_src
+        .drop_duplicates(subset=["RECEIPT_NUMBER", "Transaction Number", "Account Number"])
+        .loc[:, [
+            "RECEIPT_NUMBER",
+            "Transaction Number",
+            "Account Number",
+            "LOCAL_RECEIPT_AMOUNT",
+            "WO Currency",
+            "Transaction Type",
+        ]]
+        .copy()
+    )
+
+    df_src["AMOUNT_POS"] = df_src["LOCAL_RECEIPT_AMOUNT"].abs().round(2)
+    df_src["WO Currency"] = df_src["WO Currency"].astype(str).str.strip()
+
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template .xlsm not found: {template_path}")
+
+    wb = load_workbook(template_path, keep_vba=True, data_only=False)
+    today_dt = date.today()
+
+    # Cache per-entity sheet configuration (US, CH, TS)
+    sheet_cfg = {}
+
+    for _, rec in df_src.iterrows():
+        trx_type = str(rec["Transaction Type"] or "")
+        trx_type_up = trx_type.upper()
+
+        if trx_type_up.startswith("US"):
+            entity_key = "US"
+            new_trx_type = "US_DIR_DM_RELO_USD"
+        elif trx_type_up.startswith("CH"):
+            entity_key = "CH"
+            new_trx_type = "CH_DIR_DM_RELO_USD"
+        elif trx_type_up.startswith("TS"):
+            entity_key = "TS"
+            new_trx_type = "TS_DIR_DM_RELO_USD"
+        else:
+            # Not mapped to this file (e.g., BR)
+            continue
+
+        # Initialize / get sheet config
+        if entity_key not in sheet_cfg:
+            target_ws = None
+            for name in wb.sheetnames:
+                if name.upper().startswith(entity_key):
+                    target_ws = wb[name]
+                    break
+
+            if target_ws is None:
+                raise ValueError(
+                    f"Sheet for entity '{entity_key}' not found in 3 HC Relo Upload DM template."
+                )
+
+            ws = target_ws
+            next_row = ws.max_row + 1
+
+            def safe_find(header):
+                try:
+                    return _find_col_letter_by_header(ws, header)
+                except KeyError:
+                    return None
+
+            cfg = {
+                "ws": ws,
+                "next_row": next_row,
+                "col_trx_date": safe_find("Transaction Date"),
+                "col_gl_date": safe_find("GL Date"),
+                "col_currency": safe_find("Currency Code"),
+                "col_comments": safe_find("Comments"),
+                "col_line_number": safe_find("Line Number"),
+                "col_line_type": safe_find("Line Type"),
+                "col_item": safe_find("Item"),
+                "col_description": safe_find("Description"),
+                "col_quantity": safe_find("Quantity"),
+                # Transaction Type será SEMPRE coluna P (Txn type)
+            }
+            sheet_cfg[entity_key] = cfg
+
+        cfg = sheet_cfg[entity_key]
+        ws = cfg["ws"]
+        r = cfg["next_row"]
+        cfg["next_row"] += 1
+
+        account_number = str(rec["Account Number"])
+        trx_number = str(rec["Transaction Number"])
+        amount_pos = float(rec["AMOUNT_POS"])
+        currency = str(rec["WO Currency"])
+
+        # Fixed letters from spec
+        ws[f"I{r}"] = account_number   # Customer Number
+        ws[f"L{r}"] = account_number   # Ship To Customer Number
+
+        # Datas (Transaction Date + GL Date) = hoje
+        if cfg["col_trx_date"]:
+            ws[f"{cfg['col_trx_date']}{r}"] = today_dt
+        if cfg["col_gl_date"]:
+            ws[f"{cfg['col_gl_date']}{r}"] = today_dt
+
+        # Transaction Type NOVO, SEMPRE na coluna P (Txn type)
+        ws[f"P{r}"] = new_trx_type
+
+        # Comments formula (inclui CM / Transaction Number)
+        if cfg["col_comments"]:
+            ws[f"{cfg['col_comments']}{r}"] = (
+                f'="DM issued to offset Relocation CM - Coa vs WO " & '
+                f'TEXT(TODAY(),"mm/dd/yyyy") & " " & "{trx_number}"'
+            )
+
+        # Print option (W)
+        ws[f"W{r}"] = "Do Not Print"
+
+        # Currency code
+        if cfg["col_currency"]:
+            ws[f"{cfg['col_currency']}{r}"] = currency
+
+        # Context / Billing / etc.
+        ws[f"AC{r}"] = "DIRECT AGENCY"
+        ws[f"AD{r}"] = currency           # Billing Currency
+        ws[f"AG{r}"] = "INDEPENDENTS"     # Hotel Category
+        ws[f"AI{r}"] = "More4Apps"        # Int Header
+        ws[f"AJ{r}"] = f"DM Issued to offset CM {trx_number}"  # Reference
+
+        # Line number, type, item, description, qty
+        if cfg["col_line_number"]:
+            ws[f"{cfg['col_line_number']}{r}"] = 1
+        if cfg["col_line_type"]:
+            ws[f"{cfg['col_line_type']}{r}"] = "Line"
+        if cfg["col_item"]:
+            ws[f"{cfg['col_item']}{r}"] = "EXPWA_COMP_CM"
+        if cfg["col_description"]:
+            ws[f"{cfg['col_description']}{r}"] = "COMPENSATION CREDIT"
+        if cfg["col_quantity"]:
+            ws[f"{cfg['col_quantity']}{r}"] = 1
+
+        # UOM + amounts
+        ws[f"AP{r}"] = "EA"
+        ws[f"AQ{r}"] = amount_pos
+        ws[f"AS{r}"] = amount_pos
+
+        # Line context / Management Unit / Traveller
+        ws[f"AT{r}"] = "DIRECT AGENCY"
+        ws[f"AU{r}"] = "1097"
+        ws[f"AV{r}"] = trx_number
+
+        # Source currency/amount
+        ws[f"AW{r}"] = currency
+        ws[f"AX{r}"] = amount_pos
+
+        # Datas AZ, BA, BC
+        ws[f"AZ{r}"] = today_dt
+        ws[f"BA{r}"] = today_dt
+        ws[f"BC{r}"] = today_dt
+
+        # Reservation ID / Int Line context / Business model
+        ws[f"BD{r}"] = "REQUESTED"
+        ws[f"BE{r}"] = "EG_INVOICING"
+        ws[f"BF{r}"] = "DIR"
+
+    out_name = f"3 HC Relo Upload DM_{today_dt.strftime('%m%d%Y')}.xlsm"
+    out_path = out_dir / out_name
+    wb.save(out_path)
+    print(f"3 HC Relo Upload DM file generated: {out_path}")
     return out_path
 
 # ==========================
@@ -959,10 +1150,9 @@ def main():
             else:
                 df_matches_agg["Days Between Payment and Invoice"] = pd.NA
 
-            # Split negative days
+            # Split negative days APENAS para aba separada (sem remover de df_matches_agg)
             neg_mask = df_matches_agg["Days Between Payment and Invoice"] < 0
             df_negative_days = df_matches_agg[neg_mask].copy()
-            df_matches_agg = df_matches_agg[~neg_mask].copy()
 
             df_matches = df_matches_agg.rename(columns={
                 "receipt_amount": "LOCAL_RECEIPT_AMOUNT",
@@ -1050,7 +1240,7 @@ def main():
                 df_csv["GL Date"] = ""
                 df_csv["Adjust Date"] = ""
 
-                # Drop any rows without a Transaction Number (defensive against stray blank rows)
+                # Drop any rows without a Transaction Number (defensive)
                 df_csv = df_csv[
                     df_csv["Transaction Number"].notna()
                     & (df_csv["Transaction Number"].astype(str).str.strip() != "")
@@ -1061,8 +1251,9 @@ def main():
                 df_csv.to_csv(csv_path, index=False, encoding="cp1252")
                 print(f"CSV generated with {len(df_csv)} rows at:\n{csv_path}")
 
-    # ========= RELO MATCHES (SUMIFS by TRANSACTION NUMBER) + RELO DM =========
+    # ========= RELO MATCHES (SUMIFS by TRANSACTION NUMBER) + RELO DM / 3 HC =========
     relo_dm_path = None
+    hc_dm_path = None
     df_match_relo = None
 
     if df_relo is not None:
@@ -1147,14 +1338,33 @@ def main():
                 except Exception as e:
                     print(f"Failed to generate RELO DM file: {e}")
 
-                # NOVO STEP: comparar Reference x Applied Invoice Number
+                # Create 3 HC Relo Upload DM .xlsm file (Transaction Type != TS_CM_RELO)
+                try:
+                    hc_dm_path = build_hc_relo_dm_file(df_match_relo, HC_DM_TEMPLATE, OUTPUT_FOLDER)
+                    if hc_dm_path:
+                        print(f"3 HC Relo Upload DM (.xlsm) created: {hc_dm_path}")
+                except Exception as e:
+                    print(f"Failed to generate 3 HC Relo Upload DM file: {e}")
+
+                # Comparar Reference x Applied Invoice Number
                 try:
                     check_relo_cms_already_reversed(df_match_relo, coa_path)
                 except Exception as e:
                     print(f"Falha ao rodar checagem de 'CMs Already Reversed': {e}")
 
-    # Send email via Outlook with output files (including RELO DM if generated)
-    if "csv_path" in locals() and csv_path is not None and "cash_xlsx_path" in locals() and cash_xlsx_path is not None:
+    # Send email via Outlook with output files (including RELO DM / 3 HC DM if generated)
+    attachments = []
+
+    if "cash_xlsx_path" in locals() and cash_xlsx_path is not None:
+        attachments.append(cash_xlsx_path)
+    if "csv_path" in locals() and csv_path is not None:
+        attachments.append(csv_path)
+    if "relo_dm_path" in locals() and relo_dm_path:
+        attachments.append(relo_dm_path)
+    if "hc_dm_path" in locals() and hc_dm_path:
+        attachments.append(hc_dm_path)
+
+    if attachments:
         today_comment = date.today().strftime("%m/%d/%Y")
         email_to = "hotelcollectbilling@expedia.com"
         email_subject = f"COA vs WO {today_comment}"
@@ -1162,11 +1372,8 @@ def main():
             f"Hi team,\n\n"
             f"Please see attached the COA vs WO outputs for {today_comment}.\n\n"
             f"Best regards,\n"
-            f"Jos\n"
+            f"Global Billing\n"
         )
-        attachments = [csv_path, cash_xlsx_path]
-        if "relo_dm_path" in locals() and relo_dm_path:
-            attachments.append(relo_dm_path)
         send_outlook_email_with_attachments(email_to, email_subject, email_body, attachments)
 
 if __name__ == "__main__":
