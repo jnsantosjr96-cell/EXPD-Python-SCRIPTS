@@ -565,7 +565,7 @@ def build_ts_relo_dm_file(df_match_relo, template_path: Path, out_dir: Path):
         for colL in preserve_letters:
             _copy_default_from_row(ws, colL, 10, r)
 
-        # Context also preserves default from row 10
+        # Context também preserva default da linha 10
         _copy_default_from_row(ws, col_context, 10, r)
 
         # Line values
@@ -794,17 +794,18 @@ def _extract_invoice_from_reference(ref: str) -> str:
     m = re.search(r"\d+", s)
     return m.group(0) if m else s
 
-def check_relo_cms_already_reversed(df_match_relo: pd.DataFrame, coa_path: Path):
+def check_relo_cms_already_reversed(df_match_relo: pd.DataFrame, coa_path: Path) -> pd.DataFrame:
     """
     1) Pega todos os CMs da aba Match RELO
     2) Roda a CM_APPLIED_QUERY no Oracle (só para esses CMs)
     3) Compara Reference (limpa) x Applied Invoice Number
     4) CMs onde não bate (e têm Applied Invoice Number preenchido) vão
        para a aba 'CMs Already Reversed' na planilha-mãe.
+    5) Retorna df_match_relo filtrado SEM esses CMs (para não irem para Match RELO nem DMs).
     """
     if df_match_relo is None or df_match_relo.empty:
         print("Match RELO vazio. Nada para comparar com Applied Invoice Number.")
-        return
+        return df_match_relo
 
     # Lista de CMs únicos da aba Match RELO
     cm_list = (
@@ -817,7 +818,7 @@ def check_relo_cms_already_reversed(df_match_relo: pd.DataFrame, coa_path: Path)
     )
     if not cm_list:
         print("Nenhum CM encontrado em Match RELO.")
-        return
+        return df_match_relo
 
     print(f"Rodando CM_APPLIED_QUERY para {len(cm_list)} CM(s) da aba Match RELO...")
 
@@ -831,7 +832,7 @@ def check_relo_cms_already_reversed(df_match_relo: pd.DataFrame, coa_path: Path)
             rows = cur.fetchall()
             if not rows:
                 print("CM_APPLIED_QUERY não retornou linhas.")
-                return
+                return df_match_relo
             cols = [d[0] for d in cur.description]
             df_cm = pd.DataFrame(rows, columns=cols)
 
@@ -880,7 +881,7 @@ def check_relo_cms_already_reversed(df_match_relo: pd.DataFrame, coa_path: Path)
             "Nenhum CM da aba Match RELO foi identificado como 'Already Reversed' "
             "(Reference bate com Applied Invoice Number ou não há aplicação)."
         )
-        return
+        return df_match_relo
 
     # Marca explicitamente o status
     df_reversed["Status"] = "CMs Already Reversed"
@@ -895,6 +896,27 @@ def check_relo_cms_already_reversed(df_match_relo: pd.DataFrame, coa_path: Path)
         f"Aba 'CMs Already Reversed' criada com {len(df_reversed)} linha(s) "
         "onde Reference != Applied Invoice Number."
     )
+
+    # === NOVO: remover esses CMs do df_match_relo que segue para Match RELO / DMs ===
+    reversed_trx_numbers = (
+        df_reversed["Transaction Number"]
+        .astype(str)
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+    df_filtered = df_match_relo.copy()
+    df_filtered["Transaction Number"] = df_filtered["Transaction Number"].astype(str).str.strip()
+    df_filtered = df_filtered[
+        ~df_filtered["Transaction Number"].isin(reversed_trx_numbers)
+    ].copy()
+
+    print(
+        f"{len(df_match_relo) - len(df_filtered)} linha(s) removida(s) de Match RELO/DMs "
+        "por estarem em 'CMs Already Reversed'."
+    )
+
+    return df_filtered
 
 # ==========================
 # MAIN PIPELINE
@@ -1319,38 +1341,39 @@ def main():
                     "Entered Currency": "WO Currency",
                 })
 
-                # Write Match RELO sheet in COA
-                with pd.ExcelWriter(coa_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
-                    df_match_relo.to_excel(w, sheet_name="Match RELO", index=False)
-                print(f"Sheet 'Match RELO' created with {len(df_match_relo)} rows.")
+                # === NOVO FLUXO: rodar checagem de CMs Already Reversed antes de gravar Match RELO / gerar DMs ===
+                try:
+                    df_match_relo_filtered = check_relo_cms_already_reversed(df_match_relo, coa_path)
+                except Exception as e:
+                    print(f"Falha ao rodar checagem de 'CMs Already Reversed': {e}")
+                    df_match_relo_filtered = df_match_relo
 
-                # Also write Match RELO into the Cash file, if generated
+                # Write Match RELO sheet in COA (SEM os CMs Already Reversed)
+                with pd.ExcelWriter(coa_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
+                    df_match_relo_filtered.to_excel(w, sheet_name="Match RELO", index=False)
+                print(f"Sheet 'Match RELO' created with {len(df_match_relo_filtered)} rows (excluídos CMs Already Reversed).")
+
+                # Also write Match RELO into the Cash file, if generated (SEM os CMs Already Reversed)
                 if "cash_xlsx_path" in locals() and cash_xlsx_path is not None:
                     with pd.ExcelWriter(cash_xlsx_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as w:
-                        df_match_relo.to_excel(w, sheet_name="Match RELO", index=False)
-                    print(f"Sheet 'Match RELO' added to Cash file: {cash_xlsx_path}")
+                        df_match_relo_filtered.to_excel(w, sheet_name="Match RELO", index=False)
+                    print(f"Sheet 'Match RELO' added to Cash file (sem CMs Already Reversed): {cash_xlsx_path}")
 
-                # Create RELO DM .xlsm file (only TS_CM_RELO)
+                # Create RELO DM .xlsm file (only TS_CM_RELO, SEM CMs Already Reversed)
                 try:
-                    relo_dm_path = build_ts_relo_dm_file(df_match_relo, RELO_DM_TEMPLATE, OUTPUT_FOLDER)
+                    relo_dm_path = build_ts_relo_dm_file(df_match_relo_filtered, RELO_DM_TEMPLATE, OUTPUT_FOLDER)
                     if relo_dm_path:
                         print(f"RELO DM (.xlsm) created: {relo_dm_path}")
                 except Exception as e:
                     print(f"Failed to generate RELO DM file: {e}")
 
-                # Create 3 HC Relo Upload DM .xlsm file (Transaction Type != TS_CM_RELO)
+                # Create 3 HC Relo Upload DM .xlsm file (Transaction Type != TS_CM_RELO, SEM CMs Already Reversed)
                 try:
-                    hc_dm_path = build_hc_relo_dm_file(df_match_relo, HC_DM_TEMPLATE, OUTPUT_FOLDER)
+                    hc_dm_path = build_hc_relo_dm_file(df_match_relo_filtered, HC_DM_TEMPLATE, OUTPUT_FOLDER)
                     if hc_dm_path:
                         print(f"3 HC Relo Upload DM (.xlsm) created: {hc_dm_path}")
                 except Exception as e:
                     print(f"Failed to generate 3 HC Relo Upload DM file: {e}")
-
-                # Comparar Reference x Applied Invoice Number
-                try:
-                    check_relo_cms_already_reversed(df_match_relo, coa_path)
-                except Exception as e:
-                    print(f"Falha ao rodar checagem de 'CMs Already Reversed': {e}")
 
     # Send email via Outlook with output files (including RELO DM / 3 HC DM if generated)
     attachments = []
