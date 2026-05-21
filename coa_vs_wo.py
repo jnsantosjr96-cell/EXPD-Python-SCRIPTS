@@ -47,7 +47,7 @@ HC_DM_TEMPLATE = Path(
 
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
 USERNAME = "josenjr"
-PASSWORD = "qyuxYQZFs13"      # CHANGE ME
+PASSWORD = "---------"      # CHANGE ME
 DSN      = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
 
 # WO adjustments query
