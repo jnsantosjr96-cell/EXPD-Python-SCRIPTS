@@ -63,7 +63,7 @@ TESSDATA_PREFIX = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\
 # -------------------- ORACLE CONFIG --------------------
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
 ORACLE_USERNAME = "josenjr"
-ORACLE_PASSWORD = "qyuxYQZFs13"  # Replace locally
+ORACLE_PASSWORD = "-------"  # Replace locally
 ORACLE_DSN = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
 
 _ORACLE_CLIENT_INITIALIZED = False
