@@ -171,29 +171,33 @@ WHERE HCA.CUSTOMER_CLASS_CODE = 'HOTEL'
   AND HCA.Attribute1 IN ({expedia_ids})
 """
 
-ORACLE_HOTEL_BASE_SQL = """
-SELECT
-    HCA.ACCOUNT_NUMBER AS ORACLE_ID,
-    HCA.ATTRIBUTE1 AS EXPEDIA_ID,
-    HZP.PARTY_NAME AS HOTEL_NAME,
-    HZP.COUNTRY AS COUNTRY_ABBR
-FROM AR.HZ_CUST_ACCOUNTS HCA
-JOIN AR.HZ_PARTIES HZP
-    ON HZP.PARTY_ID = HCA.PARTY_ID
-WHERE HCA.CUSTOMER_CLASS_CODE = 'HOTEL'
-"""
-
+# NOTE:
+# This query below uses name normalization with REGEXP_REPLACE to improve match tolerance
+# (special characters, '&' vs 'AND', repeated spaces, punctuation).
+# It is slower for larger volumes.
+# If performance becomes an issue, replace this logic with a simpler UPPER(TRIM(HZP.PARTY_NAME))
+# comparison and accept stricter name matching.
 ORACLE_HOTEL_BY_NAME_SQL_TEMPLATE = """
 SELECT
     HCA.ACCOUNT_NUMBER AS ORACLE_ID,
+    HCA.CUSTOMER_CLASS_CODE,
     HCA.ATTRIBUTE1 AS EXPEDIA_ID,
     HZP.PARTY_NAME AS HOTEL_NAME,
     HZP.COUNTRY AS COUNTRY_ABBR
 FROM AR.HZ_CUST_ACCOUNTS HCA
 JOIN AR.HZ_PARTIES HZP
     ON HZP.PARTY_ID = HCA.PARTY_ID
-WHERE HCA.CUSTOMER_CLASS_CODE = 'HOTEL'
-  AND UPPER(TRIM(HZP.PARTY_NAME)) IN ({hotel_names})
+WHERE TRIM(
+        REGEXP_REPLACE(
+            REGEXP_REPLACE(
+                REPLACE(UPPER(HZP.PARTY_NAME), '&', ' AND '),
+                '[^A-Z0-9 ]',
+                ' '
+            ),
+            ' +',
+            ' '
+        )
+      ) IN ({hotel_names})
 """
 
 # -------------------- ENSURE / INSTALL DEPS --------------------
@@ -1344,11 +1348,15 @@ def normalize_hotel_name_for_sql(val: Optional[str]) -> Optional[str]:
     except Exception:
         pass
 
-    s = str(val).strip().upper()
+    s = unidecode(str(val)).upper().strip()
     if not s or s == "<NA>":
         return None
 
-    return s
+    s = s.replace("&", " AND ")
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    return s or None
 
 def _norm_header_key(s: str) -> str:
     if s is None:
@@ -1579,39 +1587,6 @@ def fetch_oracle_tca(expedia_ids: List[str]) -> pd.DataFrame:
 
     return df_oracle
 
-
-def fetch_oracle_hotel_base() -> pd.DataFrame:
-    print("\n[INFO] Running Oracle hotel base query for name matching...")
-
-    ensure_oracle_client()
-
-    with oracledb.connect(user=ORACLE_USERNAME, password=ORACLE_PASSWORD, dsn=ORACLE_DSN) as con:
-        with con.cursor() as cur:
-            cur.execute("ALTER SESSION SET CURRENT_SCHEMA = APPS")
-
-        t0 = time.time()
-        with con.cursor() as cur:
-            cur.execute(ORACLE_HOTEL_BASE_SQL)
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-        elapsed = time.time() - t0
-
-    print(f"[INFO] Oracle hotel base query completed. Rows: {len(rows)}. Time: {elapsed:.2f}s")
-
-    df_oracle = pd.DataFrame(rows, columns=cols)
-
-    if not df_oracle.empty:
-        df_oracle["HOTEL_NAME_MATCH"] = df_oracle["HOTEL_NAME"].apply(normalize_name_for_match)
-        df_oracle["COUNTRY_ABBR"] = df_oracle["COUNTRY_ABBR"].astype(str).str.strip().str.upper()
-
-        df_oracle = df_oracle.sort_values(["HOTEL_NAME_MATCH", "COUNTRY_ABBR", "ORACLE_ID"])
-        df_oracle = df_oracle.drop_duplicates(
-            subset=["HOTEL_NAME_MATCH", "COUNTRY_ABBR"],
-            keep="first"
-        )
-
-    return df_oracle
-
 def fetch_oracle_hotels_by_name(hotel_names: List[str]) -> pd.DataFrame:
     hotel_names = sorted({
         normalize_hotel_name_for_sql(x)
@@ -1648,48 +1623,44 @@ def fetch_oracle_hotels_by_name(hotel_names: List[str]) -> pd.DataFrame:
         df_oracle["HOTEL_NAME_MATCH"] = df_oracle["HOTEL_NAME"].apply(normalize_name_for_match)
         df_oracle["COUNTRY_ABBR"] = df_oracle["COUNTRY_ABBR"].astype(str).str.strip().str.upper()
 
-        df_oracle = df_oracle.sort_values(["HOTEL_NAME_MATCH", "COUNTRY_ABBR", "ORACLE_ID"])
+        df_oracle = df_oracle.sort_values(["HOTEL_NAME_MATCH", "ORACLE_ID"])
         df_oracle = df_oracle.drop_duplicates(
-            subset=["HOTEL_NAME_MATCH", "COUNTRY_ABBR"],
+            subset=["HOTEL_NAME_MATCH"],
             keep="first"
         )
 
     return df_oracle
 
-def add_sle_oid_from_hotel_name(df: pd.DataFrame) -> pd.DataFrame:
-    if "Hotel Name" not in df.columns:
+def add_sle_oid_from_legal_name(df: pd.DataFrame) -> pd.DataFrame:
+    if "Legal Name" not in df.columns:
         return df
 
     df = df.copy()
 
-    oracle_base = fetch_oracle_hotels_by_name(df["Hotel Name"].tolist())
+    oracle_base = fetch_oracle_hotels_by_name(df["Legal Name"].tolist())
     if oracle_base.empty:
-        insert_pos = list(df.columns).index("Hotel Name") + 1 if "Hotel Name" in df.columns else len(df.columns)
+        insert_pos = list(df.columns).index("Legal Name") + 1 if "Legal Name" in df.columns else len(df.columns)
         if "SLE OID" not in df.columns:
             df.insert(loc=insert_pos, column="SLE OID", value=pd.NA)
         return df
 
-    if "Country ISO2" not in df.columns and "Country" in df.columns:
-        df["Country ISO2"] = df["Country"].map(lambda x: to_iso2(x) or "")
-
-    df["HOTEL_NAME_MATCH"] = df["Hotel Name"].apply(normalize_name_for_match)
-    df["Country ISO2"] = df["Country ISO2"].astype(str).str.strip().str.upper()
+    df["LEGAL_NAME_MATCH"] = df["Legal Name"].apply(normalize_name_for_match)
 
     match_df = df.merge(
-        oracle_base[["HOTEL_NAME_MATCH", "COUNTRY_ABBR", "ORACLE_ID"]],
+        oracle_base[["HOTEL_NAME_MATCH", "ORACLE_ID"]],
         how="left",
-        left_on=["HOTEL_NAME_MATCH", "Country ISO2"],
-        right_on=["HOTEL_NAME_MATCH", "COUNTRY_ABBR"],
+        left_on=["LEGAL_NAME_MATCH"],
+        right_on=["HOTEL_NAME_MATCH"],
     )
 
-    insert_pos = list(df.columns).index("Hotel Name") + 1
+    insert_pos = list(df.columns).index("Legal Name") + 1
     if "SLE OID" in match_df.columns:
         match_df = match_df.drop(columns=["SLE OID"])
 
     match_df.insert(loc=insert_pos, column="SLE OID", value=match_df["ORACLE_ID"])
 
     match_df = match_df.drop(
-        columns=["HOTEL_NAME_MATCH", "COUNTRY_ABBR", "ORACLE_ID"],
+        columns=["LEGAL_NAME_MATCH", "HOTEL_NAME_MATCH", "ORACLE_ID"],
         errors="ignore",
     )
 
@@ -2144,7 +2115,7 @@ def inject_into_oid_creation_webadi(
         ws["E3"] = f"SLE OID Creation {datetime.now().strftime('%m%d%Y')}"
     except Exception as e:
         if debug:
-            print(f"[DEBUG] Failed to update EF3 in OID Creation template: {e}")
+            print(f"[DEBUG] Failed to update E3 in OID Creation template: {e}")
 
     header_row, header_map = find_header_row(
         ws, start_at_row=header_start_row, debug=debug
@@ -2152,12 +2123,11 @@ def inject_into_oid_creation_webadi(
 
     wanted = {
         "HOTEL_ID": "Expedia ID",
-        "CUSTOMER_NAME": "Hotel Name",
+        "CUSTOMER_NAME": "Legal Name",
         "TAX_REG_NUMBER": "Tax Registration Number",
         "ADDRESS_LINE_1": "Address Line 1",
         "POSTAL_CODE": "Postal Code",
         "COUNTRY": "Country ISO2",
-        "BILLING_CURRENCY": "Currency",
         "FIRST_NAME": "First Name",
         "LAST_NAME": "Last Name",
         "EMAIL_ADDRESS": "Email Address",
@@ -2181,7 +2151,10 @@ def inject_into_oid_creation_webadi(
 
     col_state = header_map.get("STATE")
     col_province = header_map.get("PROVINCE")
-    col_site_purpose = header_map.get("SITE_PURPOSE")
+
+    col_billing_currency = header_map.get("BILLING_CURRENCY") or column_index_from_string("AS")
+    col_payment_terms = column_index_from_string("AU")
+    col_preferred_language = header_map.get("PREFERRED_LANGUAGE") or column_index_from_string("BI")
 
     key_col = header_map.get("HOTEL_ID") or header_map.get("CUSTOMER_NAME")
     if not key_col:
@@ -2212,6 +2185,13 @@ def inject_into_oid_creation_webadi(
             ws.cell(current, col_state).value = None
         if col_province:
             ws.cell(current, col_province).value = None
+
+        # OID Creation fixed patterns
+        if col_billing_currency:
+            ws.cell(current, col_billing_currency).value = None
+
+        ws.cell(current, col_payment_terms).value = "MONTHLY-14"
+        ws.cell(current, col_preferred_language).value = "EN"
 
         # fixed/default values
         for webadi_col, fixed_val in fixed_values.items():
@@ -2503,7 +2483,7 @@ def main():
 
     df = add_country_iso2_column(df)
     df = add_language_abbreviation_column(df)
-    df = add_sle_oid_from_hotel_name(df)
+    df = add_sle_oid_from_legal_name(df)
 
     base_columns = list(df.columns)
 
@@ -2520,30 +2500,27 @@ def main():
     oid_creation_out_path = None
     df_oid_creation = pd.DataFrame()
 
-    if "SLE OID" in df.columns:
-        mask_no_sle_oid = df["SLE OID"].isna() | (
-            df["SLE OID"].astype(str).str.strip().isin(["", "<NA>", "nan", "None"])
-        )
+    oid_need_cols = [
+        c for c in [
+            "Expedia ID",
+            "Legal Name",
+            "Tax Registration Number",
+            "Address Line 1",
+            "State/Province",
+            "Postal Code",
+            "Country",
+            "Country ISO2",
+            "First Name",
+            "Last Name",
+            "Email Address",
+            "SLE OID",
+        ] if c in df.columns
+    ]
 
-        oid_need_cols = [
-            c for c in [
-                "Expedia ID",
-                "Hotel Name",
-                "Tax Registration Number",
-                "Address Line 1",
-                "State/Province",
-                "Postal Code",
-                "Country",
-                "Country ISO2",
-                "Currency",
-                "First Name",
-                "Last Name",
-                "Email Address",
-                "SLE OID",
-            ] if c in df.columns
-        ]
-
-        df_oid_creation = df.loc[mask_no_sle_oid, oid_need_cols].copy()
+    df_oid_creation = df.loc[
+        (df["Expedia ID"].notna()) | (df["Legal Name"].notna()),
+        oid_need_cols,
+    ].copy()
 
     try:
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
@@ -2675,7 +2652,7 @@ def main():
             except Exception as ex:
                 print(f"[ERROR] Failed to fill OID Creation WEBADI: {ex}")
         else:
-            print("[INFO] No rows without SLE OID. OID Creation WEBADI not generated.")
+            print("[INFO] No rows available for OID Creation WEBADI.")
     else:
         print("[INFO] OID Creation template not found. Skipping additional WEBADI.")
 
