@@ -51,6 +51,7 @@ DEFAULT_INPUT_DIR = r"C:\Users\josenjr\Downloads\HCPIFs"
 DEFAULT_OUTPUT_FILE = r"C:\Users\josenjr\Downloads\HCPIFs\Output\HCPIF_extraction.xlsx"
 
 DEFAULT_WEBADI_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OC WebADI SF 149540900 2-13-26 (002).xlsm"
+DEFAULT_OID_CREATION_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OID Creation WEBADI.xlsm"
 
 # -------------------- POPPLER / TESSERACT CONFIG --------------------
 
@@ -62,8 +63,16 @@ TESSDATA_PREFIX = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\
 # -------------------- ORACLE CONFIG --------------------
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
 ORACLE_USERNAME = "josenjr"
-ORACLE_PASSWORD = "---------"  # Replace locally
+ORACLE_PASSWORD = "qyuxYQZFs13"  # Replace locally
 ORACLE_DSN = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
+
+_ORACLE_CLIENT_INITIALIZED = False
+
+def ensure_oracle_client():
+    global _ORACLE_CLIENT_INITIALIZED
+    if not _ORACLE_CLIENT_INITIALIZED:
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
+        _ORACLE_CLIENT_INITIALIZED = True
 
 ORACLE_TCA_SQL_TEMPLATE = """
 SELECT
@@ -162,6 +171,36 @@ WHERE HCA.CUSTOMER_CLASS_CODE = 'HOTEL'
   AND HCA.Attribute1 IN ({expedia_ids})
 """
 
+# NOTE:
+# This query below uses name normalization with REGEXP_REPLACE to improve match tolerance
+# (special characters, '&' vs 'AND', repeated spaces, punctuation).
+# It is slower for larger volumes.
+# If performance becomes an issue, replace this logic with a simpler UPPER(TRIM(HZP.PARTY_NAME))
+# comparison and accept stricter name matching.
+ORACLE_HOTEL_BY_NAME_SQL_TEMPLATE = """
+SELECT
+    HCA.ACCOUNT_NUMBER AS ORACLE_ID,
+    HCA.CUSTOMER_CLASS_CODE,
+    HCA.ATTRIBUTE1 AS EXPEDIA_ID,
+    HZP.PARTY_NAME AS HOTEL_NAME,
+    HZP.COUNTRY AS COUNTRY_ABBR
+FROM AR.HZ_CUST_ACCOUNTS HCA
+JOIN AR.HZ_PARTIES HZP
+    ON HZP.PARTY_ID = HCA.PARTY_ID
+WHERE TRIM(
+        REGEXP_REPLACE(
+            REGEXP_REPLACE(
+                REPLACE(UPPER(HZP.PARTY_NAME), '&', ' AND '),
+                '[^A-Z0-9 ]',
+                ' '
+            ),
+            ' +',
+            ' '
+        )
+      ) IN ({hotel_names})
+  AND HCA.CUSTOMER_CLASS_CODE = 'SLE'
+"""
+
 # -------------------- ENSURE / INSTALL DEPS --------------------
 import sys
 import subprocess
@@ -176,6 +215,128 @@ from typing import Dict, List, Optional, Tuple
 
 import oracledb
 
+# -------------------- SHAREPOINT CONFIG (Graph + Azure App) --------------------
+from msal import ConfidentialClientApplication  # msal já garantido pelo ensure_package
+
+SP_TENANT_ID = "79efa2e2-5409-4b35-9714-ada0138ee76c"
+SP_CLIENT_ID = "b516125e-8383-4640-a60a-f7e1524b871d"
+SP_CLIENT_SECRET = os.environ["SP_CLIENT_SECRET"]  # definida via variável de ambiente
+SP_SCOPE = ["https://graph.microsoft.com/.default"]
+
+SP_SITE_ID = "expediacorp.sharepoint.com,5e885651-f726-43f3-abad-1707182bd7be,3c6e8dfc-ae97-4e0a-a6e8-a58687688935"
+SP_DRIVE_ID = "b!UVaIXib380OrrRcHGCvXvvyNbjyXrgpOpuilhodoiTWe-gXpkwfVSpMXueseaGTv"
+
+SP_INPUT_FOLDER = "[Projects]/Bulk HCPIF Collab - CMD & Invoicing/PDFs Ready to Load"
+SP_OUTPUT_BASE = "[Projects]/Bulk HCPIF Collab - CMD & Invoicing/Processed PDFs"
+SP_ARCHIVE_FOLDER = "[Projects]/Bulk HCPIF Collab - CMD & Invoicing/Archived PDFs - Already Bulk Uploaded"
+
+# -------------------- COUNTRY / TAX MAPPING CONFIG --------------------
+# Ajuste o nome do arquivo abaixo para o nome real da planilha de mapeamento
+COUNTRY_TAX_MAPPING_FILE = r"C:\Users\josenjr\Downloads\HCPIFs\Tax codes by country 4-30-26.xlsb"
+COUNTRY_TAX_MAPPING_SHEET = "Sheet1"  # nome da aba da planilha
+
+
+def _sp_get_token() -> str:
+    app = ConfidentialClientApplication(
+        SP_CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{SP_TENANT_ID}",
+        client_credential=SP_CLIENT_SECRET,
+    )
+    result = app.acquire_token_for_client(scopes=SP_SCOPE)
+    if "access_token" not in result:
+        raise RuntimeError(f"Erro ao obter token Graph: {result}")
+    return result["access_token"]
+
+
+def _sp_graph_get(url: str) -> Dict:
+    token = _sp_get_token()
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _encode_path(path: str) -> str:
+    """
+    Codifica o caminho da pasta/arquivo para uso na URL do Graph,
+    preservando as barras (/) e codificando espaços, &, [, ], etc.
+    """
+    clean = path.strip("/")
+    return quote(clean, safe="/")
+
+
+def sp_list_children(folder_path: str) -> List[Dict]:
+    """
+    Lista itens (arquivos/pastas) dentro de uma pasta da library.
+    folder_path: caminho relativo dentro do drive (ex.: "A/B/C").
+    """
+    encoded = _encode_path(folder_path)
+    url = (
+        f"https://graph.microsoft.com/v1.0/"
+        f"sites/{SP_SITE_ID}/drives/{SP_DRIVE_ID}"
+        f"/root:/{encoded}:/children"
+    )
+    print(f"[DEBUG] Graph URL children = {url}")
+    data = _sp_graph_get(url)
+    return data.get("value", [])
+
+
+def sp_download_pdfs_from_folder(folder_path: str, dest_dir: Path) -> List[Path]:
+    """
+    Baixa todos os PDFs de uma pasta do SharePoint para dest_dir.
+    Retorna a lista de arquivos locais.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    token = _sp_get_token()
+    items = sp_list_children(folder_path)
+    downloaded: List[Path] = []
+
+    for item in items:
+        name = item.get("name", "")
+        if not name.lower().endswith(".pdf"):
+            continue
+        file_id = item["id"]
+        url = (
+            f"https://graph.microsoft.com/v1.0/"
+            f"sites/{SP_SITE_ID}/drives/{SP_DRIVE_ID}/items/{file_id}/content"
+        )
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+        resp.raise_for_status()
+        local_path = dest_dir / name
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+        downloaded.append(local_path)
+    return downloaded
+
+
+def sp_upload_file(local_path: Path, folder_path: str):
+    """
+    Sobe (ou sobrescreve) um arquivo local para uma pasta do SharePoint.
+    folder_path: caminho relativo dentro do drive, ex. "A/B/C".
+    """
+    token = _sp_get_token()
+    file_name = local_path.name
+
+    encoded_folder = _encode_path(folder_path)
+    url = (
+        f"https://graph.microsoft.com/v1.0/"
+        f"sites/{SP_SITE_ID}/drives/{SP_DRIVE_ID}"
+        f"/root:/{encoded_folder}/{file_name}:/content"
+    )
+
+    with open(local_path, "rb") as f:
+        data = f.read()
+
+    resp = requests.put(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/octet-stream",
+        },
+        data=data,
+    )
+    resp.raise_for_status()
+
+
 REQUIRED = [
     ("pdfplumber", "pdfplumber"),
     ("pandas", "pandas"),
@@ -185,7 +346,11 @@ REQUIRED = [
     ("pycountry", "pycountry"),
     ("pytesseract", "pytesseract"),
     ("pdf2image", "pdf2image"),
+    ("msal", "msal"),
+    ("requests", "requests"),
+    ("pyxlsb", "pyxlsb")
 ]
+
 
 def ensure_package(pip_name: str, import_name: str):
     try:
@@ -195,6 +360,7 @@ def ensure_package(pip_name: str, import_name: str):
         subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
         return importlib.import_module(import_name)
 
+
 pdfplumber = ensure_package("pdfplumber", "pdfplumber")
 pd = ensure_package("pandas", "pandas")
 openpyxl = ensure_package("openpyxl", "openpyxl")
@@ -202,6 +368,9 @@ tqdm = ensure_package("tqdm", "tqdm")
 unidecode_mod = ensure_package("Unidecode", "unidecode")
 pytesseract = ensure_package("pytesseract", "pytesseract")
 pdf2image = ensure_package("pdf2image", "pdf2image")
+msal = ensure_package("msal", "msal")
+requests = ensure_package("requests", "requests")
+pyxlsb = ensure_package("pyxlsb", "pyxlsb")
 
 from unidecode import unidecode
 from pdf2image import convert_from_path
@@ -224,6 +393,7 @@ for _ext in (".jpg", ".jpeg", ".JPG", ".JPEG"):
 
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
+from urllib.parse import quote
 
 # -------------------- FIELD DEFINITIONS --------------------
 FIELDS: List[Dict] = [
@@ -292,34 +462,34 @@ NEXT_LABEL_BARRIER = re.compile(r"(?i)\b(?:" + "|".join(BARRIER_LABELS) + r")\b\
 LABEL_LINE_RE = re.compile(r"(?im)^\s*(?:" + "|".join(BARRIER_LABELS) + r")\s*:?\b")
 
 KNOWN_CURRENCIES = {"AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN",
-    "BAM", "BBD", "BDT", "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BRL",
-    "BSD", "BTN", "BWP", "BYN", "BZD",
-    "CAD", "CDF", "CHF", "CLP", "CNY", "COP", "CRC", "CUP", "CVE", "CZK",
-    "DJF", "DKK", "DOP", "DZD",
-    "EGP", "ERN", "ETB", "EUR",
-    "FJD", "FKP",
-    "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD",
-    "HKD", "HNL", "HTG", "HUF",
-    "IDR", "ILS", "INR", "IQD", "IRR", "ISK",
-    "JMD", "JOD", "JPY",
-    "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT",
-    "LAK", "LBP", "LKR", "LRD", "LSL", "LYD",
-    "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR",
-    "MWK", "MXN", "MYR", "MZN",
-    "NAD", "NGN", "NIO", "NOK", "NPR", "NZD",
-    "OMR",
-    "PAB", "PEN", "PGK", "PHP", "PKR", "PLN", "PYG",
-    "QAR",
-    "RON", "RSD", "RUB", "RWF",
-    "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SLL", "SOS",
-    "SRD", "SSP", "STN", "SVC", "SYP", "SZL",
-    "THB", "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS",
-    "UAH", "UGX", "USD", "UYU", "UZS",
-    "VED", "VES", "VND", "VUV",
-    "WST",
-    "XAF", "XCD", "XDR", "XOF", "XPF",
-    "YER",
-    "ZAR", "ZMW", "ZWL",}
+                    "BAM", "BBD", "BDT", "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BRL",
+                    "BSD", "BTN", "BWP", "BYN", "BZD",
+                    "CAD", "CDF", "CHF", "CLP", "CNY", "COP", "CRC", "CUP", "CVE", "CZK",
+                    "DJF", "DKK", "DOP", "DZD",
+                    "EGP", "ERN", "ETB", "EUR",
+                    "FJD", "FKP",
+                    "GBP", "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD",
+                    "HKD", "HNL", "HTG", "HUF",
+                    "IDR", "ILS", "INR", "IQD", "IRR", "ISK",
+                    "JMD", "JOD", "JPY",
+                    "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT",
+                    "LAK", "LBP", "LKR", "LRD", "LSL", "LYD",
+                    "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR",
+                    "MWK", "MXN", "MYR", "MZN",
+                    "NAD", "NGN", "NIO", "NOK", "NPR", "NZD",
+                    "OMR",
+                    "PAB", "PEN", "PGK", "PHP", "PKR", "PLN", "PYG",
+                    "QAR",
+                    "RON", "RSD", "RUB", "RWF",
+                    "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SLL", "SOS",
+                    "SRD", "SSP", "STN", "SVC", "SYP", "SZL",
+                    "THB", "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS",
+                    "UAH", "UGX", "USD", "UYU", "UZS",
+                    "VED", "VES", "VND", "VUV",
+                    "WST",
+                    "XAF", "XCD", "XDR", "XOF", "XPF",
+                    "YER",
+                    "ZAR", "ZMW", "ZWL", }
 
 DEFAULT_CURRENCY_BY_COUNTRY = {
     "GERMANY": "EUR",
@@ -349,6 +519,7 @@ DEFAULT_CURRENCY_BY_COUNTRY = {
     "CA": "CAD",
 }
 
+
 # -------------------- DATE / VALUE HELPERS --------------------
 def is_valid_date_token(token: str) -> bool:
     token = token.strip()
@@ -360,6 +531,7 @@ def is_valid_date_token(token: str) -> bool:
             continue
     return False
 
+
 def extract_first_date_token(s: Optional[str]) -> Optional[str]:
     if not s:
         return None
@@ -369,6 +541,7 @@ def extract_first_date_token(s: Optional[str]) -> Optional[str]:
             return token
     return None
 
+
 def extract_two_dates_from_lines(full_text: str):
     tokens = DATE_TOKEN_REGEX.findall(full_text or "")
     valids = [t for t in tokens if is_valid_date_token(t)]
@@ -377,6 +550,7 @@ def extract_two_dates_from_lines(full_text: str):
     if len(valids) == 1:
         return valids[0], None
     return None, None
+
 
 def contains_date_like(s: str) -> bool:
     if not s:
@@ -389,8 +563,10 @@ def contains_date_like(s: str) -> bool:
         return True
     return False
 
+
 def normalize_block_text(s: str) -> str:
     return (s or "").replace("\u00A0", " ").replace("\t", " ")
+
 
 def cut_at_next_label(s: str) -> str:
     if not s:
@@ -398,12 +574,14 @@ def cut_at_next_label(s: str) -> str:
     m = NEXT_LABEL_BARRIER.search(s)
     return s[: m.start()].strip() if m else s.strip()
 
+
 def strip_signature_prefix(s: Optional[str]) -> Optional[str]:
     if not s:
         return s
     return (
-        re.sub(r"(?i)^\s*(signature|signed|signee|signer)\s*:\s*", "", s).strip() or None
+            re.sub(r"(?i)^\s*(signature|signed|signee|signer)\s*:\s*", "", s).strip() or None
     )
+
 
 def strip_parenthesized_dates(s: Optional[str]) -> Optional[str]:
     if not s:
@@ -414,7 +592,9 @@ def strip_parenthesized_dates(s: Optional[str]) -> Optional[str]:
     s = re.sub(r"\([^0-9()]*\d[^()]*\)", "", s)
     return s.strip() or None
 
+
 LEADING_JUNK_RE = re.compile(r"^[^0-9A-Za-z]+")
+
 
 def strip_leading_junk(s: Optional[str]) -> Optional[str]:
     if s is None:
@@ -422,6 +602,7 @@ def strip_leading_junk(s: Optional[str]) -> Optional[str]:
     s = str(s).lstrip()
     s = LEADING_JUNK_RE.sub("", s)
     return s
+
 
 def clean_extracted_value(s: Optional[str]) -> Optional[str]:
     if s is None:
@@ -438,10 +619,12 @@ def clean_extracted_value(s: Optional[str]) -> Optional[str]:
         return None
     return v or None
 
+
 def looks_like_postal(s: Optional[str]) -> bool:
     if not s:
         return False
     return bool(POSTAL_LIKE.match(s.strip()))
+
 
 def sanitize_country(val: Optional[str], currency: Optional[str]) -> Optional[str]:
     if not val:
@@ -451,21 +634,29 @@ def sanitize_country(val: Optional[str], currency: Optional[str]) -> Optional[st
         return None
     v_clean = v.strip()
     v_upper = v_clean.upper()
+    if currency:
+        v_clean = re.sub(
+            rf"(?i)^\s*{re.escape(str(currency).strip())}\s+",
+            "",
+            v_clean,
+        ).strip()
+        v_upper = v_clean.upper()
     if re.fullmatch(r"[A-Za-z]{2,4}", v_clean):
         if currency and v_upper == (currency or "").strip().upper():
             return None
         return None
     if (
-        HEADER_NOISE.search(v_clean)
-        or re.search(r"\d", v_clean)
-        or SIGNATURE_NOISE.match(v_clean)
-        or contains_date_like(v_clean)
+            HEADER_NOISE.search(v_clean)
+            or re.search(r"\d", v_clean)
+            or SIGNATURE_NOISE.match(v_clean)
+            or contains_date_like(v_clean)
     ):
         return None
     return v_clean
 
+
 def sanitize_state_and_postal(
-    state_val: Optional[str], postal_val: Optional[str]
+        state_val: Optional[str], postal_val: Optional[str]
 ) -> Tuple[Optional[str], Optional[str]]:
     s = clean_extracted_value(state_val) if state_val else None
     p = clean_extracted_value(postal_val) if postal_val else None
@@ -483,13 +674,15 @@ def sanitize_state_and_postal(
 
     return s, p
 
+
 def is_alpha_line(s: str) -> bool:
     s = s.strip()
     if not s or "@" in s:
         return False
     if contains_date_like(s) or SIGNATURE_NOISE.match(s):
         return False
-    return re.fullmatch(rf"[{UNICODE_LETTERS} .'\-()]{2,120}", s) is not None
+    return re.fullmatch(rf"[{UNICODE_LETTERS} .'\-()]{2, 120}", s) is not None
+
 
 def try_same_line_block(text: str, label_regex: str) -> Optional[str]:
     pattern = re.compile(
@@ -503,35 +696,9 @@ def try_same_line_block(text: str, label_regex: str) -> Optional[str]:
             return cand
     return None
 
-def try_next_line_block(
-    text: str, label_regex: str, all_label_variants: List[str]
-) -> Optional[str]:
-    label_only = re.compile(
-        LABEL_ONLY_PATTERN_TMPL.format(label=label_regex),
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    m = label_only.search(text)
-    if not m:
-        return None
-    tail = text[m.end() :]
-    start_of_label = re.compile(
-        r"(?im)^\s*(?:" + "|".join(all_label_variants) + r")\s*:\b"
-    )
-    for ln in tail.splitlines():
-        cand = clean_extracted_value(ln)
-        if not cand:
-            continue
-        if start_of_label.match(cand):
-            return None
-        if HEADER_NOISE.search(cand) or SIGNATURE_NOISE.match(cand) or contains_date_like(
-            cand
-        ):
-            continue
-        return cand
-    return None
 
 def try_next_line_block(
-    text: str, label_regex: str, all_label_variants: List[str]
+        text: str, label_regex: str, all_label_variants: List[str]
 ) -> Optional[str]:
     label_only = re.compile(
         LABEL_ONLY_PATTERN_TMPL.format(label=label_regex),
@@ -550,14 +717,13 @@ def try_next_line_block(
             continue
         if start_of_label.match(cand):
             return None
-        if (
-            HEADER_NOISE.search(cand)
-            or SIGNATURE_NOISE.match(cand)
-            or contains_date_like(cand)
+        if HEADER_NOISE.search(cand) or SIGNATURE_NOISE.match(cand) or contains_date_like(
+                cand
         ):
             continue
         return cand
     return None
+
 
 def try_next_line_block_state(text: str, label_regex: str) -> Optional[str]:
     """
@@ -584,14 +750,15 @@ def try_next_line_block_state(text: str, label_regex: str) -> Optional[str]:
         if not cand:
             continue
         if (
-            HEADER_NOISE.search(cand)
-            or SIGNATURE_NOISE.match(cand)
-            or contains_date_like(cand)
+                HEADER_NOISE.search(cand)
+                or SIGNATURE_NOISE.match(cand)
+                or contains_date_like(cand)
         ):
             continue
         return cand
 
     return None
+
 
 def words_from_page(page) -> List[Dict]:
     return page.extract_words(
@@ -600,6 +767,7 @@ def words_from_page(page) -> List[Dict]:
         keep_blank_chars=False,
         use_text_flow=True,
     ) or []
+
 
 def find_label_anchors(words: List[Dict], label_tokens: List[str]) -> List[Dict]:
     def _norm(s: str) -> str:
@@ -611,7 +779,7 @@ def find_label_anchors(words: List[Dict], label_tokens: List[str]) -> List[Dict]
     norm_labels = [_norm(x) for x in label_tokens]
     for i in range(n - m + 1):
         if all(_norm(words[i + j]["text"]) == norm_labels[j] for j in range(m)):
-            seq = words[i : i + m]
+            seq = words[i: i + m]
             anchors.append(
                 {
                     "x0": min(w["x0"] for w in seq),
@@ -622,8 +790,9 @@ def find_label_anchors(words: List[Dict], label_tokens: List[str]) -> List[Dict]
             )
     return anchors
 
+
 def collect_tokens_on_same_line_right(
-    words: List[Dict], anchor: Dict, y_tol: float = 6.0
+        words: List[Dict], anchor: Dict, y_tol: float = 6.0
 ):
     a_top, a_bot, a_x1 = anchor["top"], anchor["bottom"], anchor["x1"]
     line_tokens = []
@@ -632,11 +801,12 @@ def collect_tokens_on_same_line_right(
             continue
         if abs(w["top"] - a_top) <= y_tol or abs(w["bottom"] - a_bot) <= y_tol:
             line_tokens.append(w)
-    line_tokens.sort(key=lambda k: (k["top"], k["x0"]))
+    line_tokens.sort(key=lambda k: k["x0"])
     return line_tokens
 
+
 def collect_tokens_next_line_down(
-    words, anchor, x_window=360.0, v_range=(0.5, 80.0)
+        words, anchor, x_window=360.0, v_range=(0.5, 80.0)
 ):
     a_bot, a_x1 = anchor["bottom"], anchor["x1"]
     v_min, v_max = a_bot + v_range[0], a_bot + v_range[1]
@@ -649,22 +819,41 @@ def collect_tokens_next_line_down(
     cand.sort(key=lambda k: (k["top"], k["x0"]))
     return cand
 
+
+def join_tokens_until_next_label(tokens: List[Dict]) -> str:
+    kept = []
+    for t in tokens:
+        txt = (t.get("text") or "").strip()
+        if not txt:
+            continue
+        if txt.endswith(":"):
+            break
+        kept.append(t)
+    return " ".join(t["text"] for t in kept).strip()
+
+
 def join_tokens(tokens: List[Dict]) -> str:
     return " ".join(t["text"] for t in tokens).strip()
 
+
 CURRENCY3 = re.compile(r"^[A-Za-z]{3}$")
+
 
 def extract_currency_positional(words: List[Dict], anchors: List[Dict]) -> Optional[str]:
     for a in anchors:
         same = collect_tokens_on_same_line_right(words, a)
         for t in same:
-            if CURRENCY3.match(t["text"].strip()):
-                return t["text"].upper()
+            cur = (t.get("text") or "").strip().upper()
+            if CURRENCY3.match(cur) and cur in KNOWN_CURRENCIES:
+                return cur
+
         down = collect_tokens_next_line_down(words, a, x_window=360, v_range=(0.5, 100))
         for t in down:
-            if CURRENCY3.match(t["text"].strip()):
-                return t["text"].upper()
+            cur = (t.get("text") or "").strip().upper()
+            if CURRENCY3.match(cur) and cur in KNOWN_CURRENCIES:
+                return cur
     return None
+
 
 def extract_date_positional(words: List[Dict], anchors: List[Dict]) -> Optional[str]:
     for a in anchors:
@@ -682,28 +871,68 @@ def extract_date_positional(words: List[Dict], anchors: List[Dict]) -> Optional[
                 return m.group(1)
     return None
 
+
 def extract_country_positional(words: List[Dict], anchors: List[Dict]) -> Optional[str]:
     for a in anchors:
         same = collect_tokens_on_same_line_right(words, a)
-        raw = (
-            join_tokens(same)
-            if same
-            else join_tokens(
-                collect_tokens_next_line_down(words, a, x_window=480, v_range=(0.5, 120))
-            )
-        )
+        raw = join_tokens_until_next_label(same)
+
         if raw:
             val = clean_extracted_value(raw)
             if (
-                val
-                and not HEADER_NOISE.search(val)
-                and not re.search(r"\d", val)
-                and not re.fullmatch(r"[A-Za-z]{2,4}", val)
+                    val
+                    and not HEADER_NOISE.search(val)
+                    and not re.search(r"\d", val)
+                    and not re.fullmatch(r"[A-Za-z]{2,4}", val)
+            ):
+                return val
+
+        down = collect_tokens_next_line_down(words, a, x_window=480, v_range=(0.5, 120))
+        raw = join_tokens(down)
+        if raw:
+            val = clean_extracted_value(raw)
+            if (
+                    val
+                    and not HEADER_NOISE.search(val)
+                    and not re.search(r"\d", val)
+                    and not re.fullmatch(r"[A-Za-z]{2,4}", val)
             ):
                 return val
     return None
 
+
+def extract_preferred_language_positional(
+        words: List[Dict], anchors: List[Dict]
+) -> Optional[str]:
+    for a in anchors:
+        same = collect_tokens_on_same_line_right(words, a)
+        raw = join_tokens_until_next_label(same)
+        if raw:
+            val = clean_extracted_value(raw)
+            if (
+                    val
+                    and not HEADER_NOISE.search(val)
+                    and not SIGNATURE_NOISE.match(val)
+                    and not contains_date_like(val)
+            ):
+                return val
+
+        down = collect_tokens_next_line_down(words, a, x_window=300, v_range=(0.5, 80))
+        raw = join_tokens(down)
+        if raw:
+            val = clean_extracted_value(raw)
+            if (
+                    val
+                    and not HEADER_NOISE.search(val)
+                    and not SIGNATURE_NOISE.match(val)
+                    and not contains_date_like(val)
+            ):
+                return val
+    return None
+
+
 TRN_BAD = re.compile(r"(?i)^(registered|select a status)$")
+
 
 def sanitize_trn(val: Optional[str]) -> Optional[str]:
     v = clean_extracted_value(val)
@@ -715,6 +944,7 @@ def sanitize_trn(val: Optional[str]) -> Optional[str]:
         return None
     return v
 
+
 def extract_trn_same_line(words: List[Dict], anchors: List[Dict]) -> Optional[str]:
     for a in anchors:
         same = collect_tokens_on_same_line_right(words, a, y_tol=6.0)
@@ -725,6 +955,7 @@ def extract_trn_same_line(words: List[Dict], anchors: List[Dict]) -> Optional[st
         if val:
             return val
     return None
+
 
 def is_garbage_text(text: str) -> bool:
     """
@@ -752,6 +983,7 @@ def is_garbage_text(text: str) -> bool:
         return False
     return True
 
+
 def ocr_extract_full_text(pdf_path: Path) -> str:
     """
     Convert PDF to images and use OCR (pytesseract) to extract readable text.
@@ -771,6 +1003,7 @@ def ocr_extract_full_text(pdf_path: Path) -> str:
         except Exception:
             continue
     return "\n".join(texts)
+
 
 def strip_state_if_person_name(results: Dict[str, Optional[str]]) -> None:
     """
@@ -799,6 +1032,7 @@ def strip_state_if_person_name(results: Dict[str, Optional[str]]) -> None:
 
     if s_n in candidates:
         results["State/Province"] = None
+
 
 def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
     results = {f["col"]: None for f in FIELDS}
@@ -832,6 +1066,12 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
             anchors_state = find_label_anchors(words, ["state", "province"]) + \
                             find_label_anchors(words, ["state"]) + \
                             find_label_anchors(words, ["province"])
+            anchors_language = find_label_anchors(words, ["preferred", "language"])
+
+            if not results["Preferred Language"]:
+                results["Preferred Language"] = extract_preferred_language_positional(
+                    words, anchors_language
+                )
 
             if not results["Currency"]:
                 results["Currency"] = extract_currency_positional(words, anchors_currency)
@@ -920,10 +1160,13 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                     found = try_next_line_block(full_text, lab, BARRIER_LABELS)
                     if found:
                         break
-            if not found and col.lower().startswith("email"):
-                m = EMAIL_FALLBACK.search(full_text)
-                if m:
-                    found = m.group(0)
+            if col.lower().startswith("email"):
+                if found and "@" not in str(found):
+                    found = None
+                if not found:
+                    m = EMAIL_FALLBACK.search(full_text)
+                    if m:
+                        found = m.group(0)
             results[col] = found
         # ------- fim fallback FIELDS -------
 
@@ -976,9 +1219,9 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
         cur = results.get("Currency")
         c_val = sanitize_country(results.get("Country"), cur)
         if c_val and (
-            re.fullmatch(r"[A-Za-z]{2,4}", c_val)
-            or (cur and c_val.upper() == cur.upper())
-            or contains_date_like(c_val)
+                re.fullmatch(r"[A-Za-z]{2,4}", c_val)
+                or (cur and c_val.upper() == cur.upper())
+                or contains_date_like(c_val)
         ):
             c_val = None
         results["Country"] = c_val or results.get("Country")
@@ -1012,8 +1255,8 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
             except Exception:
                 iso2_country = ""
             cur_final = (
-                DEFAULT_CURRENCY_BY_COUNTRY.get(country_norm)
-                or DEFAULT_CURRENCY_BY_COUNTRY.get(iso2_country.upper(), None)
+                    DEFAULT_CURRENCY_BY_COUNTRY.get(country_norm)
+                    or DEFAULT_CURRENCY_BY_COUNTRY.get(iso2_country.upper(), None)
             )
             results["Currency"] = cur_final
 
@@ -1035,17 +1278,27 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
 
         return results
 
+
 def find_pdfs(input_dir: Path) -> List[Path]:
     return sorted([p for p in input_dir.rglob("*.pdf") if p.is_file()])
 
+
 WEBADI_SHEET_DEFAULT = "WebADI"
 
-def to_iso2(country_name: Optional[str]) -> Optional[str]:
-    if not country_name:
-        return None
-    v = str(country_name).strip()
 
-    # Normalização forte para tratar casos como Türkiye/Turkiye/Turkey
+def to_iso2(country_name: Optional[str]) -> Optional[str]:
+    if country_name is None:
+        return None
+    try:
+        if pd.isna(country_name):
+            return None
+    except Exception:
+        pass
+
+    v = str(country_name).strip()
+    if not v or v.upper() == "<NA>":
+        return None
+
     v_norm = unidecode(v).strip().upper()
 
     MANUAL_ISO2 = {
@@ -1055,20 +1308,56 @@ def to_iso2(country_name: Optional[str]) -> Optional[str]:
     if v_norm in MANUAL_ISO2:
         return MANUAL_ISO2[v_norm]
 
-    # Se já for código de 2 letras (ex.: "TR")
     if re.fullmatch(r"[A-Za-z]{2}", v):
         return v.upper()
 
     if pycountry:
-        # Tenta primeiro com a forma normalizada, depois com o valor original
         for cand in (v_norm, v):
             try:
                 c = pycountry.countries.lookup(cand)
                 return getattr(c, "alpha_2", None)
             except Exception:
                 continue
-        return None
     return None
+
+
+def normalize_name_for_match(val: Optional[str]) -> Optional[str]:
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    s = unidecode(str(val)).upper().strip()
+    if not s or s == "<NA>":
+        return None
+
+    s = s.replace("&", " AND ")
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    return s or None
+
+def normalize_hotel_name_for_sql(val: Optional[str]) -> Optional[str]:
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+
+    s = unidecode(str(val)).upper().strip()
+    if not s or s == "<NA>":
+        return None
+
+    s = s.replace("&", " AND ")
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    return s or None
 
 def _norm_header_key(s: str) -> str:
     if s is None:
@@ -1081,6 +1370,7 @@ def _norm_header_key(s: str) -> str:
     s = s.replace("/", "_").replace("-", "_").replace(" ", "_")
     s = re.sub(r"[^A-Z0-9_]", "", s)
     return s
+
 
 HEADER_SYNONYMS = {
     "BATCH_NAME": {"BATCH", "BATCHNAME"},
@@ -1110,11 +1400,13 @@ HEADER_SYNONYMS = {
     "BILL_TO": {"BILLTO", "SITE_USE_CODE", "SITE_USE", "SITEUSECODE"},
 }
 
+
 def _apply_synonym(key: str) -> str:
     for target, aliases in HEADER_SYNONYMS.items():
         if key == target or key in aliases:
             return target
     return key
+
 
 def _debug_dump_first_rows(ws, n=6):
     print("\n[DEBUG] Sample of first rows (normalized):")
@@ -1125,6 +1417,7 @@ def _debug_dump_first_rows(ws, n=6):
             vals.append(_apply_synonym(_norm_header_key(v)) if isinstance(v, str) else "")
         print(f"  R{r:02d}: {vals}")
 
+
 def _debug_dump_row(ws, r):
     vals = []
     for c in range(1, ws.max_column + 1):
@@ -1132,11 +1425,12 @@ def _debug_dump_row(ws, r):
         vals.append((_apply_synonym(_norm_header_key(v)) if isinstance(v, str) else "", v))
     print(f"[DEBUG] Row {r} -> {[x for x in vals if x[1]]}")
 
+
 def find_header_row(
-    ws,
-    must_have_cols=("HOTEL_ID", "CUSTOMER_NAME"),
-    start_at_row: int = 5,
-    debug: bool = False,
+        ws,
+        must_have_cols=("HOTEL_ID", "CUSTOMER_NAME"),
+        start_at_row: int = 5,
+        debug: bool = False,
 ) -> Tuple[int, Dict[str, int]]:
     must_have = {_apply_synonym(_norm_header_key(x)) for x in must_have_cols}
     if debug:
@@ -1175,6 +1469,7 @@ def find_header_row(
         "Check the template."
     )
 
+
 def last_data_row(ws, header_row: int, key_col_index: int) -> int:
     r = ws.max_row
     while r > header_row:
@@ -1182,6 +1477,7 @@ def last_data_row(ws, header_row: int, key_col_index: int) -> int:
             return r
         r -= 1
     return header_row
+
 
 def clone_row(ws, src_row: int, dest_row: int):
     for c in range(1, ws.max_column + 1):
@@ -1194,6 +1490,7 @@ def clone_row(ws, src_row: int, dest_row: int):
         dst.number_format = src.number_format
         dst.protection = copy.copy(src.protection)
         dst.alignment = copy.copy(src.alignment)
+
 
 def unprotect_workbook_and_sheets(wb, debug: bool = False):
     try:
@@ -1219,6 +1516,7 @@ def unprotect_workbook_and_sheets(wb, debug: bool = False):
             if debug:
                 print(f"[DEBUG] Failed to unprotect sheet {ws.title}: {e}")
 
+
 def _is_blank(val) -> bool:
     """True para None, string vazia ou NaN."""
     if val is None:
@@ -1230,6 +1528,7 @@ def _is_blank(val) -> bool:
         return bool(_pd.isna(val))
     except Exception:
         return False
+
 
 def format_comment_from_filename(fn: str) -> str:
     if not fn:
@@ -1250,6 +1549,7 @@ def format_comment_from_filename(fn: str) -> str:
 
     return base.strip()
 
+
 def fetch_oracle_tca(expedia_ids: List[str]) -> pd.DataFrame:
     expedia_ids = sorted({str(x).strip() for x in expedia_ids if pd.notna(x) and str(x).strip()})
     if not expedia_ids:
@@ -1260,7 +1560,7 @@ def fetch_oracle_tca(expedia_ids: List[str]) -> pd.DataFrame:
 
     print(f"\n[INFO] Running Oracle query for {len(expedia_ids)} Expedia ID(s)...")
 
-    oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
+    ensure_oracle_client()
 
     with oracledb.connect(user=ORACLE_USERNAME, password=ORACLE_PASSWORD, dsn=ORACLE_DSN) as con:
         with con.cursor() as cur:
@@ -1288,8 +1588,87 @@ def fetch_oracle_tca(expedia_ids: List[str]) -> pd.DataFrame:
 
     return df_oracle
 
+def fetch_oracle_hotels_by_name(hotel_names: List[str]) -> pd.DataFrame:
+    hotel_names = sorted({
+        normalize_hotel_name_for_sql(x)
+        for x in hotel_names
+        if normalize_hotel_name_for_sql(x)
+    })
+
+    if not hotel_names:
+        return pd.DataFrame()
+
+    names_literal = ", ".join("'" + n.replace("'", "''") + "'" for n in hotel_names)
+    sql = ORACLE_HOTEL_BY_NAME_SQL_TEMPLATE.format(hotel_names=names_literal)
+
+    print(f"\n[INFO] Running Oracle hotel-name query for {len(hotel_names)} hotel name(s)...")
+
+    ensure_oracle_client()
+
+    with oracledb.connect(user=ORACLE_USERNAME, password=ORACLE_PASSWORD, dsn=ORACLE_DSN) as con:
+        with con.cursor() as cur:
+            cur.execute("ALTER SESSION SET CURRENT_SCHEMA = APPS")
+
+        t0 = time.time()
+        with con.cursor() as cur:
+            cur.execute(sql)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+        elapsed = time.time() - t0
+
+    print(f"[INFO] Oracle hotel-name query completed. Rows: {len(rows)}. Time: {elapsed:.2f}s")
+
+    df_oracle = pd.DataFrame(rows, columns=cols)
+
+    if not df_oracle.empty:
+        df_oracle["HOTEL_NAME_MATCH"] = df_oracle["HOTEL_NAME"].apply(normalize_name_for_match)
+        df_oracle["COUNTRY_ABBR"] = df_oracle["COUNTRY_ABBR"].astype(str).str.strip().str.upper()
+
+        df_oracle = df_oracle.sort_values(["HOTEL_NAME_MATCH", "ORACLE_ID"])
+        df_oracle = df_oracle.drop_duplicates(
+            subset=["HOTEL_NAME_MATCH"],
+            keep="first"
+        )
+
+    return df_oracle
+
+def add_sle_oid_from_legal_name(df: pd.DataFrame) -> pd.DataFrame:
+    if "Legal Name" not in df.columns:
+        return df
+
+    df = df.copy()
+
+    oracle_base = fetch_oracle_hotels_by_name(df["Legal Name"].tolist())
+    if oracle_base.empty:
+        insert_pos = list(df.columns).index("Legal Name") + 1 if "Legal Name" in df.columns else len(df.columns)
+        if "SLE OID" not in df.columns:
+            df.insert(loc=insert_pos, column="SLE OID", value=pd.NA)
+        return df
+
+    df["LEGAL_NAME_MATCH"] = df["Legal Name"].apply(normalize_name_for_match)
+
+    match_df = df.merge(
+        oracle_base[["HOTEL_NAME_MATCH", "ORACLE_ID"]],
+        how="left",
+        left_on=["LEGAL_NAME_MATCH"],
+        right_on=["HOTEL_NAME_MATCH"],
+    )
+
+    insert_pos = list(df.columns).index("Legal Name") + 1
+    if "SLE OID" in match_df.columns:
+        match_df = match_df.drop(columns=["SLE OID"])
+
+    match_df.insert(loc=insert_pos, column="SLE OID", value=match_df["ORACLE_ID"])
+
+    match_df = match_df.drop(
+        columns=["LEGAL_NAME_MATCH", "HOTEL_NAME_MATCH", "ORACLE_ID"],
+        errors="ignore",
+    )
+
+    return match_df
+
 def enrich_hcpif_with_oracle(
-    df: pd.DataFrame, base_columns: List[str]
+        df: pd.DataFrame, base_columns: List[str]
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if "Expedia ID" not in df.columns:
         print("[WARN] Column 'Expedia ID' not found; skipping Oracle enrichment.")
@@ -1316,8 +1695,31 @@ def enrich_hcpif_with_oracle(
         suffixes=("", "_ORACLE"),
     )
 
-    merged["Found SLE OID"] = merged["ORACLE_ID"]
-    merged["Found SLE Name"] = merged["SLE_NAME"]
+    # ── FALLBACK: se não casou por country, tenta só pelo Expedia ID ──
+    mask_no_match = merged["ORACLE_ID"].isna() if "ORACLE_ID" in merged.columns else pd.Series([False] * len(merged))
+    if mask_no_match.any():
+        df_oracle_by_eid = df_oracle.drop_duplicates(subset=["EXPEDIA_ID"], keep="first")
+        fallback = (
+            df.loc[mask_no_match, ["Expedia ID"]]
+            .merge(
+                df_oracle_by_eid,
+                how="left",
+                left_on="Expedia ID",
+                right_on="EXPEDIA_ID",
+            )
+        )
+        oracle_fill_cols = [
+            "ORACLE_ID", "HOTEL_NAME", "ORACLE_CURRENCY",
+            "CURRENT_RM", "RECEIPT_METHOD_NAME", "SLE_NAME",
+            "SLE_OID", "TAI_BM", "DUPLICATE_COUNT",
+        ]
+        for col in oracle_fill_cols:
+            if col in fallback.columns and col in merged.columns:
+                merged.loc[mask_no_match, col] = fallback[col].values
+    # ── fim fallback ──
+
+    merged["Found Hotel OID"] = merged["ORACLE_ID"]
+    merged["Found Hotel Name"] = merged["HOTEL_NAME"]
 
     if "Hotel Name" in merged.columns:
         merged["Hotel Name"] = merged["Hotel Name"].where(
@@ -1329,6 +1731,8 @@ def enrich_hcpif_with_oracle(
         merged["Hotel Name"] = merged["HOTEL_NAME"]
 
     merged["Oracle Currency"] = merged["ORACLE_CURRENCY"]
+    merged["Current RM"] = merged["CURRENT_RM"]
+
     if "Currency" in merged.columns:
         merged["Currency"] = merged["Currency"].astype(str).str.upper().str.strip()
         merged["Oracle Currency"] = merged["Oracle Currency"].astype(str).str.upper().str.strip()
@@ -1359,14 +1763,15 @@ def enrich_hcpif_with_oracle(
 
     oracle_key_cols = [c for c in ["Expedia ID", "Country ISO2", "file_name", "file_path"] if c in merged.columns]
     exclude_for_details = set(base_columns) | {
-        "Found SLE OID",
-        "Found SLE Name",
+        "Found Hotel OID",
+        "Found Hotel Name",
         "Oracle Currency",
         "Currency Matches Oracle",
         "Comments",
     }
     oracle_value_cols = [c for c in merged.columns if c not in exclude_for_details]
-    mask_has_oracle = merged["ORACLE_ID"].notna() if "ORACLE_ID" in merged.columns else merged["Found SLE OID"].notna()
+    mask_has_oracle = merged["ORACLE_ID"].notna() if "ORACLE_ID" in merged.columns else merged[
+        "Found Hotel OID"].notna()
     df_oracle_details = merged.loc[mask_has_oracle, oracle_key_cols + oracle_value_cols].copy()
 
     series_rm = merged.get("RECEIPT_METHOD_NAME", pd.Series([""] * len(merged))).astype(str)
@@ -1387,7 +1792,8 @@ def enrich_hcpif_with_oracle(
             "They remain in the main Extraction sheet and WEBADI."
         )
 
-    extra_cols = ["Found SLE OID", "Found SLE Name", "Oracle Currency", "Currency Matches Oracle", "Comments"]
+    extra_cols = ["Found Hotel OID", "Found Hotel Name", "Oracle Currency", "Currency Matches Oracle", "Comments",
+                  "Current RM"]
     final_main_cols = list(base_columns)
     for col in extra_cols:
         if col in df_main_raw.columns and col not in final_main_cols:
@@ -1398,229 +1804,6 @@ def enrich_hcpif_with_oracle(
 
     return df_main, df_excluded, df_oracle_details
 
-# -------------------- MAIN --------------------
-def main():
-    ap = argparse.ArgumentParser(
-        description="Extract HCPIF fields into Excel (R2.6 + WEBADI injection + OCR fallback + Oracle enrich)."
-    )
-    ap.add_argument("--input_dir", type=str, default=str(DEFAULT_INPUT_DIR))
-    ap.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT_FILE))
-    ap.add_argument(
-        "--webadi_template",
-        type=str,
-        default=None,
-        help="Path to WEBADI .xlsm/.xlsx template",
-    )
-    ap.add_argument(
-        "--webadi_output",
-        type=str,
-        default=None,
-        help="Path to save filled copy. "
-        "If omitted, generates 'OC WEBADI MMDDYYYY.xlsm' in the same folder as the template.",
-    )
-    ap.add_argument(
-        "--webadi_mode",
-        type=str,
-        choices=["append", "replace"],
-        default="replace",
-        help="append (clone last row); replace (clear data region before writing).",
-    )
-    ap.add_argument(
-        "--webadi_sheet",
-        type=str,
-        default=WEBADI_SHEET_DEFAULT,
-        help="WEBADI sheet name (default: WebADI).",
-    )
-    ap.add_argument(
-        "--webadi_header_start_row",
-        type=int,
-        default=5,
-        help="Row to start searching for header (default: 5).",
-    )
-    ap.add_argument(
-        "--webadi_debug",
-        action="store_true",
-        help="Prints header/sheet diagnostics.",
-    )
-    ap.add_argument(
-        "--webadi_unprotect",
-        dest="webadi_unprotect",
-        action="store_true",
-        help="Unprotect workbook/sheets before writing (default: True).",
-    )
-    ap.add_argument(
-        "--webadi_keep_protection",
-        dest="webadi_unprotect",
-        action="store_false",
-        help="Do NOT unprotect workbook/sheets before writing.",
-    )
-
-    ap.set_defaults(webadi_unprotect=True)
-
-    args = ap.parse_args()
-
-    input_dir = Path(args.input_dir)
-    raw_out = Path(args.output)
-
-    output_path = (
-        raw_out / "HCPIF_extraction.xlsx"
-        if (raw_out.exists() and raw_out.is_dir())
-        else (raw_out if raw_out.suffix.lower() == ".xlsx" else raw_out.with_suffix(".xlsx"))
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not input_dir.exists():
-        print(f"[ERROR] Input folder not found: {input_dir}")
-        sys.exit(1)
-
-    pdf_files = find_pdfs(input_dir)
-    if not pdf_files:
-        print(f"[ERROR] No PDFs found in: {input_dir}")
-        sys.exit(2)
-
-    rows = []
-
-    print(f"\nReading {len(pdf_files)} PDF(s) from: {input_dir}\n")
-    for pdf in tqdm.tqdm(pdf_files, desc="Processing PDFs"):
-        try:
-            data = extract_fields_positional(pdf)
-            data["file_name"] = pdf.name
-            data["file_path"] = str(pdf.resolve())
-            rows.append(data)
-        except Exception as e:
-            print(f"[ERROR] Failed to process {pdf.name}: {e}")
-            rows.append(
-                {
-                    "file_name": pdf.name,
-                    "file_path": str(pdf.resolve()),
-                    "status": f"error: {e}",
-                }
-            )
-
-    df = pd.DataFrame(rows)
-
-    ordered_cols = [f["col"] for f in FIELDS]
-    for col in ordered_cols:
-        if col not in df.columns:
-            df[col] = pd.NA
-
-    aux_cols = [c for c in df.columns if c not in ordered_cols]
-    df = df[ordered_cols + aux_cols]
-
-    def _strip_cell(v):
-        if isinstance(v, str):
-            return strip_leading_junk(v)
-        return v
-
-    df = df.applymap(_strip_cell)
-
-    df = add_country_iso2_column(df)
-
-    base_columns = list(df.columns)
-
-    df, df_excluded, df_oracle_details = enrich_hcpif_with_oracle(df, base_columns)
-
-    df = sanitize_legal_name_column(df)
-    if not df_excluded.empty:
-        df_excluded = sanitize_legal_name_column(df_excluded)
-
-    try:
-        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="Extraction", index=False)
-            if not df_excluded.empty:
-                df_excluded.to_excel(
-                    writer, sheet_name="Excluded_DIRECTDEBIT_TAIBM", index=False
-                )
-            if not df_oracle_details.empty:
-                df_oracle_details.to_excel(
-                    writer, sheet_name="Oracle_Details", index=False
-                )
-
-        print("\n[OK] Done!")
-        print(f"- PDFs read from: {input_dir}")
-        print(f"- Excel saved to: {output_path}\n")
-    except PermissionError:
-        print("\n[ERROR] Could not write the Excel file.")
-        print(f"Destination: {output_path}")
-        print("Common causes:")
-        print("  1) File is currently OPEN in Excel.")
-        print("  2) You lack permission.")
-        raise
-
-    template_path = None
-    if args.webadi_template:
-        template_path = Path(args.webadi_template)
-    else:
-        default_tpl = Path(DEFAULT_WEBADI_TEMPLATE)
-        if default_tpl.exists():
-            template_path = default_tpl
-
-    if template_path:
-        if args.webadi_output:
-            out_path = Path(args.webadi_output)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            today_str = datetime.now().strftime("%m%d%Y")
-            out_name = f"OC WEBADI {today_str}.xlsm"
-            out_path = template_path.parent / out_name
-
-        print(f"[INFO] WEBADI template: {template_path}")
-        print(f"[INFO] WEBADI output: {out_path}")
-        print(
-            f"[INFO] WEBADI sheet: {args.webadi_sheet} | header_start_row={args.webadi_header_start_row}"
-        )
-
-        need_cols = {
-            "Expedia ID",
-            "Legal Name",
-            "Address Line 1",
-            "City",
-            "State/Province",
-            "Postal Code",
-            "Country",
-            "Currency",
-            "First Name",
-            "Last Name",
-            "Email Address",
-            "Preferred Language",
-            "Tax Registration Number",
-            "Hotel Name",
-            "Effective Date of Change",
-        }
-
-        present = [c for c in need_cols if c in df.columns]
-        if not present:
-            print("[WARN] No required columns for WEBADI are available.")
-        else:
-            df2 = df.loc[
-                (df["Expedia ID"].notna()) | (df["Legal Name"].notna()),
-                present,
-            ]
-            if not len(df2):
-                print("[WARN] Nothing to insert into WEBADI (no Expedia ID / Legal Name).")
-            else:
-                print(f"[INFO] WEBADI mode: {args.webadi_mode}")
-                try:
-                    inject_into_webadi(
-                        template_path,
-                        out_path,
-                        df2,
-                        mode=args.webadi_mode,
-                        sheet_name=args.webadi_sheet,
-                        header_start_row=args.webadi_header_start_row,
-                        debug=args.webadi_debug,
-                        unprotect=args.webadi_unprotect,
-                    )
-                except Exception as ex:
-                    print(f"[ERROR] Failed to fill WEBADI: {ex}")
-                    print(
-                        "Suggestions: check sheet name, unprotect workbook (if needed), "
-                        "and validate the header row."
-                    )
-    else:
-        print(
-            "[INFO] WEBADI step not executed (no --webadi_template and no default template found)."
-        )
 
 def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
     """
@@ -1686,18 +1869,26 @@ def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
     # Se não conseguiu mapear com segurança, deixa em branco no WEBADI
     return None
 
-# -------------------- ORACLE ENRICH / HELPER FUNCS --------------------
 
 def inject_into_webadi(
-    template_path: Path,
-    out_path: Optional[Path],
-    df: pd.DataFrame,
-    mode: str = "replace",
-    sheet_name: str = WEBADI_SHEET_DEFAULT,
-    header_start_row: int = 5,
-    debug: bool = False,
-    unprotect: bool = True,
+        template_path: Path,
+        out_path: Optional[Path],
+        df: pd.DataFrame,
+        mode: str = "replace",
+        sheet_name: str = WEBADI_SHEET_DEFAULT,
+        header_start_row: int = 5,
+        debug: bool = False,
+        unprotect: bool = True,
 ):
+    """
+    Preenche o WEBADI com base no df (já enriquecido com WEBADI_COUNTRY / WEBADI_TAX_*).
+
+    Campos especiais:
+      - COUNTRY (coluna AA)        <- df["WEBADI_COUNTRY"]
+      - TAX_REGIME_CODE (coluna L) <- df["WEBADI_TAX_REGIME_CODE"]
+      - TAX (coluna M)             <- df["WEBADI_TAX"]
+      - TAX_REG_STATUS (coluna N)  <- "REGISTERED" se df["Tax Registration Status"] contiver "REGISTERED"
+    """
     if not template_path.exists():
         raise FileNotFoundError(f"WEBADI template not found: {template_path}")
 
@@ -1720,6 +1911,7 @@ def inject_into_webadi(
         raise RuntimeError(f"Sheet '{sheet_name}' not found in template.")
     ws = wb[sheet_name]
 
+    # Atualiza BATCH_NAME em E3 se o template estiver com "*TEXT"
     try:
         d3 = ws["D3"].value
         if isinstance(d3, str) and d3.strip().lower().replace(" ", "") == "*text":
@@ -1735,13 +1927,21 @@ def inject_into_webadi(
         ws, start_at_row=header_start_row, debug=debug
     )
 
+    # Mapeamento: header normalizado do WEBADI -> coluna do df
     wanted = {
         "HOTEL_ID": "Expedia ID",
         "CUSTOMER_NAME": "Hotel Name",
         "ADDRESS_LINE_1": "Address Line 1",
         "CITY": "City",
         "POSTAL_CODE": "Postal Code",
-        "COUNTRY": "Country",
+        # COUNTY (se quiser manter como o Country original do HCPIF)
+        "COUNTRY": "WEBADI_COUNTRY",
+        # TAX_REGIME_CODE (L): Tax Regime Code do VLOOKUP
+        "TAX_REGIME_CODE": "WEBADI_TAX_REGIME_CODE",
+        # TAX (M): Tax do VLOOKUP
+        "TAX": "WEBADI_TAX",
+        # TAX_REG_STATUS (N): status vindo do HCPIF Extraction
+        "TAX_REG_STATUS": "Tax Registration Status",
         "BILLING_CURRENCY": "Currency",
         "FIRST_NAME": "First Name",
         "LAST_NAME": "Last Name",
@@ -1754,6 +1954,9 @@ def inject_into_webadi(
     col_state = header_map.get("STATE")
     col_province = header_map.get("PROVINCE")
     col_bill_to = header_map.get("BILL_TO")
+    col_current_rm = column_index_from_string("AB")
+    col_others = column_index_from_string("J")
+    col_comments = column_index_from_string("AP")
 
     if not col_bill_to:
         col_bill_to = column_index_from_string("Q")
@@ -1771,6 +1974,7 @@ def inject_into_webadi(
             "Could not find key columns (HOTEL_ID/CUSTOMER_NAME) in WebADI header."
         )
 
+    # Limpa ou clona linhas conforme o modo
     if mode.lower() == "replace":
         last = ws.max_row
         for _ in range(header_row + 1, last + 1):
@@ -1788,6 +1992,7 @@ def inject_into_webadi(
             )
 
     current = base_row
+
     for _, rec in df.iterrows():
         iso2 = to_iso2(rec.get("Country"))
         stateprov = rec.get("State/Province")
@@ -1802,25 +2007,49 @@ def inject_into_webadi(
         if col_site_purpose:
             ws.cell(current, col_site_purpose).value = "BILL_TO"
 
+        ws.cell(current, col_others).value = "Others"
+
         # Zera sempre STATE/PROVINCE nas linhas novas para não herdar lixo
         if col_state:
             ws.cell(current, col_state).value = None
         if col_province:
             ws.cell(current, col_province).value = None
 
+        # Preenche colunas conforme mapeamento
         for webadi_col, script_col in wanted.items():
             col_idx = header_map.get(webadi_col)
             if not col_idx:
                 continue
             val = rec.get(script_col)
 
-            # País (ISO2 ou nome). Se não houver valor, limpa a célula.
+            # COUNTRY (AA): país vindo do VLOOKUP (WEBADI_COUNTRY)
             if webadi_col == "COUNTRY":
                 if _is_blank(val):
                     ws.cell(current, col_idx).value = None
                 else:
-                    v2 = to_iso2(val) or val
-                    ws.cell(current, col_idx).value = v2
+                    ws.cell(current, col_idx).value = val
+
+            # TAX_REGIME_CODE (L): Tax Regime Code do VLOOKUP
+            elif webadi_col == "TAX_REGIME_CODE":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    ws.cell(current, col_idx).value = val
+
+            # TAX (M): Tax do VLOOKUP
+            elif webadi_col == "TAX":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    ws.cell(current, col_idx).value = val
+
+            # TAX_REG_STATUS (N): 'REGISTERED' se vier assim do HCPIF Extraction
+            elif webadi_col == "TAX_REG_STATUS":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    s = str(val).strip().upper()
+                    ws.cell(current, col_idx).value = "REGISTERED" if "REGISTERED" in s else None
 
             # Moeda: 3 letras ou, se não tiver valor, limpa.
             elif webadi_col == "BILLING_CURRENCY":
@@ -1847,6 +2076,20 @@ def inject_into_webadi(
                 else:
                     ws.cell(current, col_idx).value = val
 
+        # Current RM -> coluna AB
+        val_current_rm = rec.get("Current RM")
+        if _is_blank(val_current_rm):
+            ws.cell(current, col_current_rm).value = None
+        else:
+            ws.cell(current, col_current_rm).value = val_current_rm
+
+        # COMMENTS From HCPIF Extraction
+        val_comments = rec.get("Comments")
+        if _is_blank(val_comments):
+            ws.cell(current, col_comments).value = None
+        else:
+            ws.cell(current, col_comments).value = str(val_comments).strip()
+
         # Preencher State/Province no WebADI, após limpar as colunas acima
         if not _is_blank(stateprov) and isinstance(stateprov, str):
             if iso2 == "CA" and col_province:
@@ -1860,20 +2103,186 @@ def inject_into_webadi(
     wb.save(str(out_path))
     print(f"[OK] WEBADI filled: {out_path}")
 
+
 LEGAL_NAME_CLEAN_RE = re.compile(r"[^A-Za-z0-9 ]+")
+
+
+def inject_into_oid_creation_webadi(
+        template_path: Path,
+        out_path: Optional[Path],
+        df: pd.DataFrame,
+        mode: str = "replace",
+        sheet_name: str = WEBADI_SHEET_DEFAULT,
+        header_start_row: int = 5,
+        debug: bool = False,
+        unprotect: bool = True,
+):
+    if not template_path.exists():
+        raise FileNotFoundError(f"OID Creation template not found: {template_path}")
+
+    wb = load_workbook(
+        str(template_path),
+        keep_vba=True,
+        data_only=False,
+        keep_links=True,
+    )
+
+    if unprotect:
+        unprotect_workbook_and_sheets(wb, debug=debug)
+
+    if sheet_name not in wb.sheetnames:
+        raise RuntimeError(f"Sheet '{sheet_name}' not found in OID Creation template.")
+    ws = wb[sheet_name]
+
+    # Cabeçalho / batch
+    try:
+        ws["E3"] = f"SLE OID Creation {datetime.now().strftime('%m%d%Y')}"
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] Failed to update E3 in OID Creation template: {e}")
+
+    header_row, header_map = find_header_row(
+        ws, start_at_row=header_start_row, debug=debug
+    )
+
+    wanted = {
+        "HOTEL_ID": "Expedia ID",
+        "CUSTOMER_NAME": "Legal Name",
+        "ADDRESS_LINE_1": "Address Line 1",
+        "CITY": "City",
+        "POSTAL_CODE": "Postal Code",
+        "COUNTRY": "Country ISO2",
+        "FIRST_NAME": "First Name",
+        "LAST_NAME": "Last Name",
+        "EMAIL_ADDRESS": "Email Address",
+    }
+
+    fixed_values = {
+        "SOURCE_SYSTEM": "ARLoader",
+        "CUSTOMER_LEVEL": "1",
+        "CUSTOMER_TYPE": "SLE",
+        "BUSINESS_MODEL_CODE": "DIR",
+        "ACCOUNT_STATUS": "ACTIVE",
+        "INVOICE_TYPE": "INDIVIDUAL",
+        "BILLTO_PARTY_FLAG": "Y",
+        "BILLTO_ENTITY_TYPE": "SLE",
+        "SITE_PURPOSE": "BILL_TO",
+        "PRIMARY_SITE_FLAG": "Y",
+        "PRIMARY_METHOD_FLAG": "Y",
+        "CONTACT_ROLE": "BILL_TO",
+        "PRIMARY_CONTACT_FLAG": "Y",
+    }
+
+    col_state = header_map.get("STATE")
+    col_province = header_map.get("PROVINCE")
+
+    col_billing_currency = header_map.get("BILLING_CURRENCY") or column_index_from_string("AS")
+    col_payment_terms = column_index_from_string("AU")
+    col_preferred_language = header_map.get("PREFERRED_LANGUAGE") or column_index_from_string("BI")
+
+    key_col = header_map.get("HOTEL_ID") or header_map.get("CUSTOMER_NAME")
+    if not key_col:
+        raise RuntimeError(
+            "Could not find key columns (HOTEL_ID/CUSTOMER_NAME) in OID Creation header."
+        )
+
+    if mode.lower() == "replace":
+        last = ws.max_row
+        for _ in range(header_row + 1, last + 1):
+            ws.delete_rows(header_row + 1)
+        base_row = header_row
+    else:
+        base_row = last_data_row(ws, header_row, key_col)
+
+    current = base_row
+
+    for _, rec in df.iterrows():
+        iso2 = to_iso2(rec.get("Country"))
+        stateprov = rec.get("State/Province")
+
+        current += 1
+        src_row = base_row if base_row > header_row else header_row + 1
+        clone_row(ws, src_row, current)
+
+        # limpa state/province antes
+        if col_state:
+            ws.cell(current, col_state).value = None
+        if col_province:
+            ws.cell(current, col_province).value = None
+
+        # OID Creation fixed patterns
+        if col_billing_currency:
+            ws.cell(current, col_billing_currency).value = None
+
+        ws.cell(current, col_payment_terms).value = "MONTHLY-14"
+        ws.cell(current, col_preferred_language).value = "EN"
+
+        # fixed/default values
+        for webadi_col, fixed_val in fixed_values.items():
+            col_idx = header_map.get(webadi_col)
+            if col_idx:
+                ws.cell(current, col_idx).value = fixed_val
+
+        for webadi_col, script_col in wanted.items():
+            col_idx = header_map.get(webadi_col)
+            if not col_idx:
+                continue
+
+            val = rec.get(script_col)
+
+            if _is_blank(val):
+                ws.cell(current, col_idx).value = None
+            else:
+                if webadi_col == "BILLING_CURRENCY" and isinstance(val, str):
+                    ws.cell(current, col_idx).value = val.strip().upper()
+                else:
+                    ws.cell(current, col_idx).value = val
+
+        # State/Province
+        if not _is_blank(stateprov) and isinstance(stateprov, str):
+            if iso2 == "CA" and col_province:
+                ws.cell(current, col_province).value = stateprov
+            elif iso2 != "CA" and col_state:
+                ws.cell(current, col_state).value = stateprov
+
+    if not out_path:
+        out_path = template_path
+
+    wb.save(str(out_path))
+    print(f"[OK] OID Creation WEBADI filled: {out_path}")
+
 
 def add_country_iso2_column(df: pd.DataFrame) -> pd.DataFrame:
     if "Country" not in df.columns:
         return df
+
     iso2_values = []
     for v in df["Country"]:
         try:
             iso2_values.append(to_iso2(v))
         except Exception:
             iso2_values.append(None)
+
     insert_pos = list(df.columns).index("Country") + 1
     df.insert(loc=insert_pos, column="Country ISO2", value=iso2_values)
     return df
+
+
+def add_language_abbreviation_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "Preferred Language" not in df.columns:
+        return df
+
+    lang_values = []
+    for v in df["Preferred Language"]:
+        try:
+            lang_values.append(normalize_language_to_code(v))
+        except Exception:
+            lang_values.append(None)
+
+    insert_pos = list(df.columns).index("Preferred Language") + 1
+    df.insert(loc=insert_pos, column="Language Abbreviation", value=lang_values)
+    return df
+
 
 def sanitize_legal_name_column(df: pd.DataFrame) -> pd.DataFrame:
     if "Legal Name" not in df.columns:
@@ -1888,6 +2297,413 @@ def sanitize_legal_name_column(df: pd.DataFrame) -> pd.DataFrame:
 
     df["Legal Name"] = df["Legal Name"].astype(str).apply(_clean_ln)
     return df
+
+
+def load_country_tax_mapping() -> pd.DataFrame:
+    """
+    Lê a planilha de mapeamento (COUNTRY, COUNTRY_NAME, Tax Regime Code, Tax)
+    e retorna um DataFrame limpo.
+    """
+    path = Path(COUNTRY_TAX_MAPPING_FILE)
+    if not path.exists():
+        print(f"[WARN] COUNTRY_TAX_MAPPING_FILE não encontrado: {COUNTRY_TAX_MAPPING_FILE}")
+        return pd.DataFrame()
+
+    df_map = pd.read_excel(
+        path,
+        sheet_name=COUNTRY_TAX_MAPPING_SHEET,
+        engine="pyxlsb",
+        dtype=str,
+    )
+
+    # Espera colunas:
+    # A: COUNTRY
+    # B: COUNTRY_NAME
+    # C: Tax Regime Code
+    # D: Tax
+    col_rename = {}
+    for c in df_map.columns:
+        c_norm = str(c).strip().upper().replace(" ", "_")
+        if c_norm == "COUNTRY":
+            col_rename[c] = "MAP_COUNTRY"
+        elif c_norm == "COUNTRY_NAME":
+            col_rename[c] = "COUNTRY_NAME"
+        elif c_norm in ("TAX_REGIME_CODE", "TAX_REGIME_CODE"):
+            col_rename[c] = "TAX_REGIME_CODE"
+        elif c_norm == "TAX":
+            col_rename[c] = "TAX"
+    df_map = df_map.rename(columns=col_rename)
+
+    needed = {"MAP_COUNTRY", "COUNTRY_NAME", "TAX_REGIME_CODE", "TAX"}
+    if not needed.issubset(df_map.columns):
+        print("[WARN] Country/Tax mapping não tem todas as colunas esperadas "
+              "(COUNTRY, COUNTRY_NAME, Tax Regime Code, Tax).")
+        return pd.DataFrame()
+
+    for c in ["MAP_COUNTRY", "COUNTRY_NAME", "TAX_REGIME_CODE", "TAX"]:
+        df_map[c] = df_map[c].astype(str).str.strip()
+
+    df_map = df_map[df_map["COUNTRY_NAME"] != ""].copy()
+    return df_map
+
+
+def enrich_df2_with_country_tax(df2: pd.DataFrame) -> pd.DataFrame:
+    """
+    Faz o 'VLOOKUP':
+      df2['Country']  --> mapping['COUNTRY_NAME']
+
+    Adiciona colunas:
+      - WEBADI_COUNTRY         (vai para coluna COUNTRY do WEBADI)
+      - WEBADI_TAX_REGIME_CODE (vai para TAX_REGIME_CODE do WEBADI)
+      - WEBADI_TAX             (vai para TAX do WEBADI)
+    """
+    df_map = load_country_tax_mapping()
+    if df_map.empty or "Country" not in df2.columns:
+        return df2
+
+    df2 = df2.copy()
+
+    df2["Country_norm"] = df2["Country"].astype(str).str.strip().str.upper()
+    df_map["COUNTRY_NAME_norm"] = df_map["COUNTRY_NAME"].astype(str).str.strip().str.upper()
+
+    df2 = df2.merge(
+        df_map[["COUNTRY_NAME_norm", "MAP_COUNTRY", "TAX_REGIME_CODE", "TAX"]],
+        how="left",
+        left_on="Country_norm",
+        right_on="COUNTRY_NAME_norm",
+    )
+
+    df2["WEBADI_COUNTRY"] = df2["MAP_COUNTRY"]
+    df2["WEBADI_TAX_REGIME_CODE"] = df2["TAX_REGIME_CODE"]
+    df2["WEBADI_TAX"] = df2["TAX"]
+
+    df2 = df2.drop(columns=["Country_norm", "COUNTRY_NAME_norm", "MAP_COUNTRY", "TAX_REGIME_CODE", "TAX"])
+    return df2
+
+
+# -------------------- MAIN --------------------
+def main():
+    ap = argparse.ArgumentParser(
+        description="Extract HCPIF fields into Excel (R2.6 + WEBADI injection + OCR fallback + Oracle enrich)."
+    )
+    ap.add_argument("--input_dir", type=str, default=str(DEFAULT_INPUT_DIR))
+    ap.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT_FILE))
+    ap.add_argument(
+        "--webadi_template",
+        type=str,
+        default=None,
+        help="Path to WEBADI .xlsm/.xlsx template",
+    )
+    ap.add_argument(
+        "--webadi_output",
+        type=str,
+        default=None,
+        help="Path to save filled copy. "
+             "If omitted, generates 'OC WEBADI MMDDYYYY.xlsm' in the same folder as the template.",
+    )
+    ap.add_argument(
+        "--webadi_mode",
+        type=str,
+        choices=["append", "replace"],
+        default="replace",
+        help="append (clone last row); replace (clear data region before writing).",
+    )
+    ap.add_argument(
+        "--webadi_sheet",
+        type=str,
+        default=WEBADI_SHEET_DEFAULT,
+        help="WEBADI sheet name (default: WebADI).",
+    )
+    ap.add_argument(
+        "--webadi_header_start_row",
+        type=int,
+        default=5,
+        help="Row to start searching for header (default: 5).",
+    )
+    ap.add_argument(
+        "--webadi_debug",
+        action="store_true",
+        help="Prints header/sheet diagnostics.",
+    )
+    ap.add_argument(
+        "--webadi_unprotect",
+        dest="webadi_unprotect",
+        action="store_true",
+        help="Unprotect workbook/sheets before writing (default: True).",
+    )
+    ap.add_argument(
+        "--webadi_keep_protection",
+        dest="webadi_unprotect",
+        action="store_false",
+        help="Do NOT unprotect workbook/sheets before writing.",
+    )
+
+    ap.set_defaults(webadi_unprotect=True)
+
+    args = ap.parse_args()
+
+    # ===== NOVO: pasta local por data (mm.dd.yyyy) =====
+    today_str = datetime.now().strftime("%m.%d.%Y")
+
+    base_local_dir = Path(args.input_dir or DEFAULT_INPUT_DIR)
+    run_dir = base_local_dir / today_str
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    input_dir = run_dir
+    output_path = run_dir / "HCPIF_extraction.xlsx"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"[INFO] Local run folder: {run_dir}")
+
+    # ===== NOVO: baixar PDFs do SharePoint (PDFs Ready to Load) =====
+    print("[INFO] Downloading PDFs from SharePoint input folder...")
+    downloaded = sp_download_pdfs_from_folder(SP_INPUT_FOLDER, input_dir)
+    print(f"[INFO] {len(downloaded)} PDF(s) downloaded to {input_dir}")
+
+    if not input_dir.exists():
+        print(f"[ERROR] Input folder not found: {input_dir}")
+        sys.exit(1)
+
+    pdf_files = find_pdfs(input_dir)
+    if not pdf_files:
+        print(f"[ERROR] No PDFs found in: {input_dir}")
+        sys.exit(2)
+
+    rows = []
+
+    print(f"\nReading {len(pdf_files)} PDF(s) from: {input_dir}\n")
+    for pdf in tqdm.tqdm(pdf_files, desc="Processing PDFs"):
+        try:
+            data = extract_fields_positional(pdf)
+            data["file_name"] = pdf.name
+            data["file_path"] = str(pdf.resolve())
+            rows.append(data)
+        except Exception as e:
+            print(f"[ERROR] Failed to process {pdf.name}: {e}")
+            rows.append(
+                {
+                    "file_name": pdf.name,
+                    "file_path": str(pdf.resolve()),
+                    "status": f"error: {e}",
+                }
+            )
+
+    df = pd.DataFrame(rows)
+
+    ordered_cols = [f["col"] for f in FIELDS]
+    for col in ordered_cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    aux_cols = [c for c in df.columns if c not in ordered_cols]
+    df = df[ordered_cols + aux_cols]
+
+    def _strip_cell(v):
+        if isinstance(v, str):
+            return strip_leading_junk(v)
+        return v
+
+    df = df.apply(lambda col: col.map(_strip_cell))
+
+    df = add_country_iso2_column(df)
+    df = add_language_abbreviation_column(df)
+    df = add_sle_oid_from_legal_name(df)
+
+    base_columns = list(df.columns)
+
+    df, df_excluded, df_oracle_details = enrich_hcpif_with_oracle(df, base_columns)
+
+    df = sanitize_legal_name_column(df)
+    if not df_excluded.empty:
+        df_excluded = sanitize_legal_name_column(df_excluded)
+    oid_creation_template_path = None
+    default_oid_tpl = Path(DEFAULT_OID_CREATION_TEMPLATE)
+    if default_oid_tpl.exists():
+        oid_creation_template_path = default_oid_tpl
+
+    oid_creation_out_path = None
+    df_oid_creation = pd.DataFrame()
+
+    oid_need_cols = [
+        c for c in [
+            "Expedia ID",
+            "Legal Name",
+            "Address Line 1",
+            "City",
+            "State/Province",
+            "Postal Code",
+            "Country",
+            "Country ISO2",
+            "First Name",
+            "Last Name",
+            "Email Address",
+            "SLE OID",
+        ] if c in df.columns
+    ]
+
+    df_oid_creation = df.loc[
+        (df["Expedia ID"].notna()) | (df["Legal Name"].notna()),
+        oid_need_cols,
+    ].copy()
+
+    try:
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Extraction", index=False)
+            if not df_excluded.empty:
+                df_excluded.to_excel(
+                    writer, sheet_name="Excluded_DIRECTDEBIT_TAIBM", index=False
+                )
+            if not df_oracle_details.empty:
+                df_oracle_details.to_excel(
+                    writer, sheet_name="Oracle_Details", index=False
+                )
+
+        print("\n[OK] Done!")
+        print(f"- PDFs read from: {input_dir}")
+        print(f"- Excel saved to: {output_path}\n")
+    except PermissionError:
+        print("\n[ERROR] Could not write the Excel file.")
+        print(f"Destination: {output_path}")
+        print("Common causes:")
+        print("  1) File is currently OPEN in Excel.")
+        print("  2) You lack permission.")
+        raise
+
+    template_path = None
+    if args.webadi_template:
+        template_path = Path(args.webadi_template)
+    else:
+        default_tpl = Path(DEFAULT_WEBADI_TEMPLATE)
+        if default_tpl.exists():
+            template_path = default_tpl
+
+    out_path = None
+
+    if template_path:
+        if args.webadi_output:
+            out_path = Path(args.webadi_output)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            today_str_for_webadi = datetime.now().strftime("%m%d%Y")
+            out_name = f"OC WEBADI {today_str_for_webadi}.xlsm"
+            out_path = template_path.parent / out_name
+
+        print(f"[INFO] WEBADI template: {template_path}")
+        print(f"[INFO] WEBADI output: {out_path}")
+        print(
+            f"[INFO] WEBADI sheet: {args.webadi_sheet} | header_start_row={args.webadi_header_start_row}"
+        )
+
+        need_cols = {
+            "Expedia ID",
+            "Legal Name",
+            "Address Line 1",
+            "City",
+            "State/Province",
+            "Postal Code",
+            "Country",
+            "Currency",
+            "First Name",
+            "Last Name",
+            "Email Address",
+            "Preferred Language",
+            "Tax Registration Number",
+            "Tax Registration Status",
+            "Hotel Name",
+            "Effective Date of Change",
+            "Current RM",
+            "Comments",
+        }
+
+        present = [c for c in need_cols if c in df.columns]
+        if not present:
+            print("[WARN] No required columns for WEBADI are available.")
+        else:
+            df2 = df.loc[
+                (df["Expedia ID"].notna()) | (df["Legal Name"].notna()),
+                present,
+            ]
+            if not len(df2):
+                print("[WARN] Nothing to insert into WEBADI (no Expedia ID / Legal Name).")
+            else:
+                print(f"[INFO] WEBADI mode: {args.webadi_mode}")
+
+                # ===== NOVO: aplicar VLOOKUP Country/Tax =====
+                df2 = enrich_df2_with_country_tax(df2)
+
+                try:
+                    inject_into_webadi(
+                        template_path,
+                        out_path,
+                        df2,
+                        mode=args.webadi_mode,
+                        sheet_name=args.webadi_sheet,
+                        header_start_row=args.webadi_header_start_row,
+                        debug=args.webadi_debug,
+                        unprotect=args.webadi_unprotect,
+                    )
+                except Exception as ex:
+                    print(f"[ERROR] Failed to fill WEBADI: {ex}")
+                    print(
+                        "Suggestions: check sheet name, unprotect workbook (if needed), "
+                        "and validate the header row."
+                    )
+    else:
+        print(
+            "[INFO] WEBADI step not executed (no --webadi_template and no default template found)."
+        )
+
+    if oid_creation_template_path:
+        if not df_oid_creation.empty:
+            today_str_for_oid = datetime.now().strftime("%m%d%Y")
+            oid_creation_out_path = oid_creation_template_path.parent / f"OID Creation {today_str_for_oid}.xlsm"
+
+            print(f"[INFO] OID Creation template: {oid_creation_template_path}")
+            print(f"[INFO] OID Creation output: {oid_creation_out_path}")
+            print(f"[INFO] OID Creation rows: {len(df_oid_creation)}")
+
+            try:
+                inject_into_oid_creation_webadi(
+                    oid_creation_template_path,
+                    oid_creation_out_path,
+                    df_oid_creation,
+                    mode="replace",
+                    sheet_name="WebADI",
+                    header_start_row=5,
+                    debug=args.webadi_debug,
+                    unprotect=args.webadi_unprotect,
+                )
+            except Exception as ex:
+                print(f"[ERROR] Failed to fill OID Creation WEBADI: {ex}")
+        else:
+            print("[INFO] No rows available for OID Creation WEBADI.")
+    else:
+        print("[INFO] OID Creation template not found. Skipping additional WEBADI.")
+
+    # ===== NOVO: Upload de resultados para SharePoint =====
+    try:
+        sp_output_folder = f"{SP_OUTPUT_BASE}/{today_str}"
+
+        print(f"[INFO] Uploading HCPIF_extraction.xlsx to SharePoint: {sp_output_folder}")
+        sp_upload_file(output_path, sp_output_folder)
+
+        if out_path is not None:
+            print(f"[INFO] Uploading WEBADI to SharePoint: {sp_output_folder}")
+            sp_upload_file(out_path, sp_output_folder)
+
+        if oid_creation_out_path is not None:
+            print(f"[INFO] Uploading OID Creation WEBADI to SharePoint: {sp_output_folder}")
+            sp_upload_file(oid_creation_out_path, sp_output_folder)
+
+        # Arquivar PDFs de entrada
+        for pdf in pdf_files:
+            print(f"[INFO] Archiving PDF to SharePoint: {SP_ARCHIVE_FOLDER} -> {pdf.name}")
+            sp_upload_file(pdf, SP_ARCHIVE_FOLDER)
+
+        print("[INFO] SharePoint upload completed (HCPIF, WEBADI, PDFs arquivados).")
+    except Exception as e:
+        print(f"[WARN] Failed to upload results to SharePoint: {e}")
+
 
 if __name__ == "__main__":
     main()
