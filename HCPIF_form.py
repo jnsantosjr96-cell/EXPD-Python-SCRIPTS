@@ -1,47 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-HCPIF extractor R2.6 + OCR fallback
-- Base: R2.4 (robust, Unicode-safe, anti-signature & anti-date, smart transliteration)
-- R2.5: WEBADI integration preserving macros/structure; keeps "Preferred Language" and "BATCH_NAME".
-- R2.6:
-  * Optionally unprotects workbook and all sheets before writing (CLI flag).
-  * Robust header detection (normalization, synonyms, tolerant to "HOTEL ID", NBSP, line breaks).
-  * Header search starting at row 5 (configurable).
-  * CLI for sheet name, header start row, and debug.
-Extras:
-- OCR fallback via Tesseract + pdf2image for scrambled-text PDFs.
-- Cleaning of junk characters at the beginning of fields (dates, currency, emails etc.).
-- Normalization of Today's date, Effective Date of Change and Currency, with fallbacks.
+HCPIF extractor R2.7.4
+Changes vs R2.7.3:
 
-R2.7:
-- Oracle (TCA) connection by Expedia ID (ATTRIBUTE1) with dynamic IN list.
-- Match HCPIF x Oracle by Expedia ID + country (ISO2).
-- New columns in HCPIF Extraction:
-    * Country ISO2 (right after Country)
-    * Found SLE OID (ORACLE_ID from query)
-    * Found SLE Name (SLE_NAME from query)
-    * Oracle Currency
-    * Currency Matches Oracle (YES/NO)
-    * Comments ("Updated Ownership per HCPIF - <file_name>")
-- Forces Hotel Name to be filled (uses Oracle HOTEL_NAME if empty from extraction).
-- Removes special characters from Legal Name (keeps only letters, numbers and space) in Output and WEBADI.
-- WEBADI: CUSTOMER_NAME now comes from Hotel Name (not Legal Name / SLE Name).
-- Rows where RECEIPT_METHOD_NAME contains 'DIRECT DEBIT' or TAI_BM contains 'GROUP'
-  are copied to a separate review sheet (but kept in main output and WEBADI).
+  FIX 1 – SLE OID incorrect matches
+    add_sle_oid_from_legal_name now passes the HCPIF Country ISO2 into the Oracle
+    hotel-name lookup so that deduplication is done on (HOTEL_NAME_MATCH, COUNTRY_ABBR)
+    instead of name alone. This prevents a hotel whose legal name exists in multiple
+    countries from being matched to the wrong record.
 
-R2.7.1:
-- Sends Effective Date of Change from the form to WEBADI column EFFECTIVE_DATE.
-- Comments: "Updated Ownership per HCPIF - <Case ... - EID ...>" (Case first, then EID).
-- Expands currency handling for Greece/GR (EUR), Hong Kong/HK (HKD), Canada/CA (CAD).
+  FIX 2 – Currency "euro" (and similar words) resolved to None
+    A CURRENCY_WORD_MAP is applied before the KNOWN_CURRENCIES validity check, so
+    free-text values such as "euro", "US dollar", "pound" etc. are converted to their
+    3-letter ISO codes. The DEFAULT_CURRENCY_BY_COUNTRY fallback was already correct
+    but is now a genuine last resort rather than a silent workaround.
 
-R2.7.3:
-- OCR improved (DPI 350, Tesseract --oem 3 --psm 6).
-- Postal Code:
-  * Map typical OCR confusions: O/o -> 0, G/g -> 8.
-  * Force Postal Code to contain only digits; if nothing left, set to blank.
-- State/Province:
-  * Value comes only from the labeled State/Province field (positional extraction),
-    not inferred from the "City ... State ... Postal" line or generic text search.
+  FIX 3 – New "NO OID - EC" review tab
+    After Oracle enrichment, rows where BOTH Found Hotel OID and SLE OID are blank AND
+    the business model (TAI_BM) is NOT "GROUP" (i.e. Expedia Collect / Direct) are
+    written to a separate sheet called "NO OID - EC". They are KEPT in the main
+    Extraction sheet and WEBADI as before.
+
+  FIX 4 – Remove Receipt Method from OC WEBADI
+    col_current_rm write block removed from inject_into_webadi.
+    "Current RM" is no longer pushed into column AB of the WEBADI sheet.
 """
 
 # -------------------- DEFAULT PATHS --------------------
@@ -50,7 +32,8 @@ from pathlib import Path
 DEFAULT_INPUT_DIR = r"C:\Users\josenjr\Downloads\HCPIFs"
 DEFAULT_OUTPUT_FILE = r"C:\Users\josenjr\Downloads\HCPIFs\Output\HCPIF_extraction.xlsx"
 
-DEFAULT_WEBADI_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OC WebADI SF 149540900 2-13-26 (002).xlsm"
+DEFAULT_WEBADI_UPDATE_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OC WEBADI Update template.xlsm"
+DEFAULT_WEBADI_ATTACH_SLE_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OC WEBADI Attach SLE template.xlsm"
 DEFAULT_OID_CREATION_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OID Creation WEBADI.xlsm"
 
 # -------------------- POPPLER / TESSERACT CONFIG --------------------
@@ -62,8 +45,8 @@ TESSDATA_PREFIX = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\
 
 # -------------------- ORACLE CONFIG --------------------
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
-ORACLE_USERNAME = "josenjr"
-ORACLE_PASSWORD = "qyuxYQZFs13"  # Replace locally
+ORACLE_USERNAME = "xxxxxxxxxx"
+ORACLE_PASSWORD = "XXXXXXXXXXX"  # WARNING: Hardcoded credential - should be moved to environment variable
 ORACLE_DSN = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
 
 _ORACLE_CLIENT_INITIALIZED = False
@@ -216,11 +199,11 @@ from typing import Dict, List, Optional, Tuple
 import oracledb
 
 # -------------------- SHAREPOINT CONFIG (Graph + Azure App) --------------------
-from msal import ConfidentialClientApplication  # msal já garantido pelo ensure_package
+from msal import ConfidentialClientApplication  # msal already ensured by ensure_package
 
 SP_TENANT_ID = "79efa2e2-5409-4b35-9714-ada0138ee76c"
 SP_CLIENT_ID = "b516125e-8383-4640-a60a-f7e1524b871d"
-SP_CLIENT_SECRET = os.environ["SP_CLIENT_SECRET"]  # definida via variável de ambiente
+SP_CLIENT_SECRET = os.environ["SP_CLIENT_SECRET"]  # defined via environment variable
 SP_SCOPE = ["https://graph.microsoft.com/.default"]
 
 SP_SITE_ID = "expediacorp.sharepoint.com,5e885651-f726-43f3-abad-1707182bd7be,3c6e8dfc-ae97-4e0a-a6e8-a58687688935"
@@ -229,11 +212,12 @@ SP_DRIVE_ID = "b!UVaIXib380OrrRcHGCvXvvyNbjyXrgpOpuilhodoiTWe-gXpkwfVSpMXueseaGT
 SP_INPUT_FOLDER = "[Projects]/Bulk HCPIF Collab - CMD & Invoicing/PDFs Ready to Load"
 SP_OUTPUT_BASE = "[Projects]/Bulk HCPIF Collab - CMD & Invoicing/Processed PDFs"
 SP_ARCHIVE_FOLDER = "[Projects]/Bulk HCPIF Collab - CMD & Invoicing/Archived PDFs - Already Bulk Uploaded"
+SP_SF_REPORT_FOLDER = "[Projects]/Bulk HCPIF Collab - CMD & Invoicing/SF Report"
 
 # -------------------- COUNTRY / TAX MAPPING CONFIG --------------------
-# Ajuste o nome do arquivo abaixo para o nome real da planilha de mapeamento
+# Adjust the file name below to match the actual mapping spreadsheet name
 COUNTRY_TAX_MAPPING_FILE = r"C:\Users\josenjr\Downloads\HCPIFs\Tax codes by country 4-30-26.xlsb"
-COUNTRY_TAX_MAPPING_SHEET = "Sheet1"  # nome da aba da planilha
+COUNTRY_TAX_MAPPING_SHEET = "Sheet1"  # sheet tab name
 
 
 def _sp_get_token() -> str:
@@ -244,7 +228,7 @@ def _sp_get_token() -> str:
     )
     result = app.acquire_token_for_client(scopes=SP_SCOPE)
     if "access_token" not in result:
-        raise RuntimeError(f"Erro ao obter token Graph: {result}")
+        raise RuntimeError(f"Error obtaining Graph token: {result}")
     return result["access_token"]
 
 
@@ -257,8 +241,8 @@ def _sp_graph_get(url: str) -> Dict:
 
 def _encode_path(path: str) -> str:
     """
-    Codifica o caminho da pasta/arquivo para uso na URL do Graph,
-    preservando as barras (/) e codificando espaços, &, [, ], etc.
+    Encodes the folder/file path for use in Graph URL,
+    preserving slashes (/) and encoding spaces, &, [, ], etc.
     """
     clean = path.strip("/")
     return quote(clean, safe="/")
@@ -266,8 +250,8 @@ def _encode_path(path: str) -> str:
 
 def sp_list_children(folder_path: str) -> List[Dict]:
     """
-    Lista itens (arquivos/pastas) dentro de uma pasta da library.
-    folder_path: caminho relativo dentro do drive (ex.: "A/B/C").
+    Lists items (files/folders) within a library folder.
+    folder_path: relative path within the drive (e.g., "A/B/C").
     """
     encoded = _encode_path(folder_path)
     url = (
@@ -282,8 +266,8 @@ def sp_list_children(folder_path: str) -> List[Dict]:
 
 def sp_download_pdfs_from_folder(folder_path: str, dest_dir: Path) -> List[Path]:
     """
-    Baixa todos os PDFs de uma pasta do SharePoint para dest_dir.
-    Retorna a lista de arquivos locais.
+    Downloads all PDFs from a SharePoint folder to dest_dir.
+    Returns the list of local files.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     token = _sp_get_token()
@@ -310,8 +294,8 @@ def sp_download_pdfs_from_folder(folder_path: str, dest_dir: Path) -> List[Path]
 
 def sp_upload_file(local_path: Path, folder_path: str):
     """
-    Sobe (ou sobrescreve) um arquivo local para uma pasta do SharePoint.
-    folder_path: caminho relativo dentro do drive, ex. "A/B/C".
+    Uploads (or overwrites) a local file to a SharePoint folder.
+    folder_path: relative path within the drive, e.g., "A/B/C".
     """
     token = _sp_get_token()
     file_name = local_path.name
@@ -335,6 +319,189 @@ def sp_upload_file(local_path: Path, folder_path: str):
         data=data,
     )
     resp.raise_for_status()
+
+
+def sp_get_most_recent_file(folder_path: str, extension: str = ".xlsm") -> Optional[Dict]:
+    """
+    Returns the metadata dict of the most recently modified file
+    with the given extension inside the SharePoint folder.
+    Returns None if no matching file is found.
+    """
+    items = sp_list_children(folder_path)
+    candidates = [
+        item for item in items
+        if item.get("name", "").lower().endswith(extension.lower())
+        and "file" in item  # only files, not sub-folders
+    ]
+    if not candidates:
+        # Also try .xlsx if .xlsm not found
+        candidates = [
+            item for item in items
+            if item.get("name", "").lower().endswith(".xlsx")
+            and "file" in item
+        ]
+    if not candidates:
+        return None
+
+    # Sort by lastModifiedDateTime descending
+    candidates.sort(
+        key=lambda x: x.get("lastModifiedDateTime", ""),
+        reverse=True,
+    )
+    return candidates[0]
+
+
+def check_sf_report_rebill(
+        df_extraction: "pd.DataFrame",
+        dest_dir: Path,
+) -> Tuple["pd.DataFrame", "pd.DataFrame"]:
+    """
+    Downloads the most recent SF Report from SharePoint, then cross-checks
+    the 'Expedia ID' column in df_extraction against rows in the SF Report
+    where Request Category (col I) == 'Rebill Request'.
+
+    Returns:
+        df_clean    – rows that did NOT match (safe to go to WEBADI)
+        df_rebill   – rows that matched (should go to 'Review - Existing Rebill' tab)
+                      with an extra 'SF_Case_Number' column and 'Comments' updated.
+    """
+    print("\n[INFO] Fetching most recent SF Report from SharePoint...")
+
+    sf_item = sp_get_most_recent_file(SP_SF_REPORT_FOLDER, extension=".xlsm")
+    if sf_item is None:
+        sf_item = sp_get_most_recent_file(SP_SF_REPORT_FOLDER, extension=".xlsx")
+
+    if sf_item is None:
+        print("[WARN] No SF Report file found in SharePoint. Skipping rebill check.")
+        return df_extraction, pd.DataFrame()
+
+    file_id = sf_item["id"]
+    file_name = sf_item.get("name", "SF_Report.xlsm")
+    print(f"[INFO] Most recent SF Report: {file_name} "
+          f"(modified: {sf_item.get('lastModifiedDateTime', 'unknown')})")
+
+    token = _sp_get_token()
+    url = (
+        f"https://graph.microsoft.com/v1.0/"
+        f"sites/{SP_SITE_ID}/drives/{SP_DRIVE_ID}/items/{file_id}/content"
+    )
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
+    resp.raise_for_status()
+
+    local_sf_path = dest_dir / file_name
+    with open(local_sf_path, "wb") as f:
+        f.write(resp.content)
+    print(f"[INFO] SF Report downloaded to: {local_sf_path}")
+
+    # Read the SF Report
+    # Col B = Expedia Hotel ID (index 1), Col E = Case Number (index 4),
+    # Col I = Request Category (index 8)
+    # The file may have a header row; we read with header=0.
+    try:
+        # Try xlsm as xlsx (openpyxl handles both)
+        df_sf = pd.read_excel(
+            local_sf_path,
+            sheet_name=0,          # first sheet
+            dtype=str,             # everything as string to avoid float IDs
+            engine="openpyxl",
+        )
+    except Exception as e:
+        print(f"[WARN] Could not read SF Report with openpyxl ({e}). Skipping rebill check.")
+        return df_extraction, pd.DataFrame()
+
+    # Identify the relevant columns by position (B=index 1, E=index 4, I=index 8)
+    # but also try by name for robustness
+    def _col_by_name_or_pos(df_sf: "pd.DataFrame", names: list, pos: int) -> Optional[str]:
+        for n in names:
+            for c in df_sf.columns:
+                if str(c).strip().lower() == n.lower():
+                    return c
+        # fall back to positional
+        cols = list(df_sf.columns)
+        if pos < len(cols):
+            return cols[pos]
+        return None
+
+    col_eid      = _col_by_name_or_pos(df_sf, ["expedia hotel id", "expedia_hotel_id", "hotel id"], 1)
+    col_case     = _col_by_name_or_pos(df_sf, ["case number", "case_number", "casenumber"], 4)
+    col_category = _col_by_name_or_pos(df_sf, ["request category", "request_category", "type"], 8)
+
+    if not col_eid or not col_category:
+        print(f"[WARN] Could not identify required columns in SF Report "
+              f"(eid_col={col_eid}, category_col={col_category}). "
+              "Skipping rebill check.")
+        return df_extraction, pd.DataFrame()
+
+    print(f"[INFO] SF Report columns used → EID: '{col_eid}' | "
+          f"Case: '{col_case}' | Category: '{col_category}'")
+
+    # Filter SF Report: only "Rebill Request" rows
+    mask_coo = df_sf[col_category].astype(str).str.strip().str.lower() == "rebill request"
+    df_sf_coo = df_sf[mask_coo].copy()
+
+    # Normalize EIDs in SF Report: strip whitespace, remove .0 suffix from floats, cast to str
+    def _norm_eid(v) -> str:
+        s = str(v).strip()
+        # Remove trailing ".0" that comes from Excel reading integers as floats
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+
+    df_sf_coo["_EID_NORM"] = df_sf_coo[col_eid].apply(_norm_eid)
+    # Build a lookup: eid → case_number (take first match if duplicates)
+    sf_coo_lookup: Dict[str, str] = {}
+    for _, row in df_sf_coo.iterrows():
+        eid = row["_EID_NORM"]
+        if eid and eid not in ("", "nan", "None"):
+            case = str(row[col_case]).strip() if col_case and pd.notna(row.get(col_case)) else ""
+            if eid not in sf_coo_lookup:
+                sf_coo_lookup[eid] = case
+
+    if not sf_coo_lookup:
+        print("[INFO] No 'Rebill Request' entries found in SF Report.")
+        return df_extraction, pd.DataFrame()
+
+    print(f"[INFO] {len(sf_coo_lookup)} EID(s) with 'Rebill Request' status in SF Report.")
+
+    # Cross-check with extraction
+    df_extraction = df_extraction.copy()
+    df_extraction["_EID_NORM"] = (
+        df_extraction["Expedia ID"]
+        .astype(str)
+        .str.strip()
+        .apply(_norm_eid)
+    )
+
+    mask_rebill = df_extraction["_EID_NORM"].isin(sf_coo_lookup.keys())
+
+    if not mask_rebill.any():
+        print("[INFO] No extraction EIDs matched the SF Report 'Rebill Request' list.")
+        df_extraction = df_extraction.drop(columns=["_EID_NORM"])
+        return df_extraction, pd.DataFrame()
+
+    matched_count = mask_rebill.sum()
+    print(f"[INFO] {matched_count} extraction row(s) matched SF Report 'Rebill Request'. "
+          "Moving to 'Review - Existing Rebill' tab.")
+
+    # Build the rebill dataframe
+    df_rebill = df_extraction[mask_rebill].copy()
+    df_clean  = df_extraction[~mask_rebill].copy()
+
+    # Add SF case number column
+    df_rebill["SF_Case_Number"] = df_rebill["_EID_NORM"].map(sf_coo_lookup)
+
+    # Overwrite / set Comments
+    hold_comment = "Hold HCPIF - EID under Rebill process"
+    if "Comments" in df_rebill.columns:
+        df_rebill["Comments"] = hold_comment
+    else:
+        df_rebill.insert(len(df_rebill.columns), "Comments", hold_comment)
+
+    # Clean up helper column
+    df_rebill = df_rebill.drop(columns=["_EID_NORM"])
+    df_clean  = df_clean.drop(columns=["_EID_NORM"])
+
+    return df_clean, df_rebill
 
 
 REQUIRED = [
@@ -492,32 +659,248 @@ KNOWN_CURRENCIES = {"AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG
                     "ZAR", "ZMW", "ZWL", }
 
 DEFAULT_CURRENCY_BY_COUNTRY = {
-    "GERMANY": "EUR",
-    "DE": "EUR",
-    "SPAIN": "EUR",
-    "ES": "EUR",
-    "ITALY": "EUR",
-    "IT": "EUR",
-    "MONTENEGRO": "EUR",
-    "ME": "EUR",
-    "MEXICO": "MXN",
-    "MX": "MXN",
-    "UNITED STATES": "USD",
-    "USA": "USD",
-    "US": "USD",
-    "SWITZERLAND": "CHF",
-    "CH": "CHF",
-    "THAILAND": "THB",
-    "TH": "THB",
-    "AUSTRALIA": "AUD",
-    "AU": "AUD",
-    "GREECE": "EUR",
-    "GR": "EUR",
-    "HONG KONG": "HKD",
-    "HK": "HKD",
-    "CANADA": "CAD",
-    "CA": "CAD",
+    # Eurozone countries
+    "GERMANY": "EUR", "DE": "EUR",
+    "SPAIN": "EUR", "ES": "EUR",
+    "ITALY": "EUR", "IT": "EUR",
+    "AUSTRIA": "EUR", "AT": "EUR",
+    "MONTENEGRO": "EUR", "ME": "EUR",
+    "GREECE": "EUR", "GR": "EUR",
+    "FRANCE": "EUR", "FR": "EUR",
+    "PORTUGAL": "EUR", "PT": "EUR",
+    "BELGIUM": "EUR", "BE": "EUR",
+    "NETHERLANDS": "EUR", "NL": "EUR",
+    "IRELAND": "EUR", "IE": "EUR",
+    "LUXEMBOURG": "EUR", "LU": "EUR",
+    "FINLAND": "EUR", "FI": "EUR",
+    "SLOVAKIA": "EUR", "SK": "EUR",
+    "SLOVENIA": "EUR", "SI": "EUR",
+    "ESTONIA": "EUR", "EE": "EUR",
+    "LATVIA": "EUR", "LV": "EUR",
+    "LITHUANIA": "EUR", "LT": "EUR",
+    "MALTA": "EUR", "MT": "EUR",
+    "CYPRUS": "EUR", "CY": "EUR",
+    "CROATIA": "EUR", "HR": "EUR",
+
+    # Americas
+    "MEXICO": "MXN", "MX": "MXN",
+    "UNITED STATES": "USD", "USA": "USD", "US": "USD",
+    "CANADA": "CAD", "CA": "CAD",
+    "BRAZIL": "BRL", "BR": "BRL",
+    "ARGENTINA": "ARS", "AR": "ARS",
+    "CHILE": "CLP", "CL": "CLP",
+    "COLOMBIA": "COP", "CO": "COP",
+    "PERU": "PEN", "PE": "PEN",
+    "COSTA RICA": "CRC", "CR": "CRC",
+    "PANAMA": "USD", "PA": "USD",
+    "DOMINICAN REPUBLIC": "DOP", "DO": "DOP",
+    "JAMAICA": "JMD", "JM": "JMD",
+
+    # Asia-Pacific
+    "SWITZERLAND": "CHF", "CH": "CHF",
+    "THAILAND": "THB", "TH": "THB",
+    "AUSTRALIA": "AUD", "AU": "AUD",
+    "HONG KONG": "HKD", "HK": "HKD",
+    "SINGAPORE": "SGD", "SG": "SGD",
+    "JAPAN": "JPY", "JP": "JPY",
+    "CHINA": "CNY", "CN": "CNY",
+    "INDIA": "INR", "IN": "INR",
+    "MALAYSIA": "MYR", "MY": "MYR",
+    "INDONESIA": "IDR", "ID": "IDR",
+    "PHILIPPINES": "PHP", "PH": "PHP",
+    "VIETNAM": "VND", "VN": "VND",
+    "SOUTH KOREA": "KRW", "KR": "KRW",
+    "KOREA": "KRW",
+    "TAIWAN": "TWD", "TW": "TWD",
+    "NEW ZEALAND": "NZD", "NZ": "NZD",
+    "SRI LANKA": "LKR", "LK": "LKR",
+    "MALDIVES": "MVR", "MV": "MVR",
+
+    # Middle East
+    "UNITED ARAB EMIRATES": "AED", "UAE": "AED", "AE": "AED",
+    "SAUDI ARABIA": "SAR", "SA": "SAR",
+    "ISRAEL": "ILS", "IL": "ILS",
+    "TURKEY": "TRY", "TR": "TRY",
+    "TURKIYE": "TRY",
+    "EGYPT": "EGP", "EG": "EGP",
+    "JORDAN": "JOD", "JO": "JOD",
+    "QATAR": "QAR", "QA": "QAR",
+    "BAHRAIN": "BHD", "BH": "BHD",
+    "KUWAIT": "KWD", "KW": "KWD",
+    "OMAN": "OMR", "OM": "OMR",
+
+    # Europe (non-Euro)
+    "UNITED KINGDOM": "GBP", "UK": "GBP", "GB": "GBP",
+    "ENGLAND": "GBP", "SCOTLAND": "GBP", "WALES": "GBP",
+    "NORWAY": "NOK", "NO": "NOK",
+    "SWEDEN": "SEK", "SE": "SEK",
+    "DENMARK": "DKK", "DK": "DKK",
+    "POLAND": "PLN", "PL": "PLN",
+    "CZECH REPUBLIC": "CZK", "CZ": "CZK",
+    "CZECHIA": "CZK",
+    "HUNGARY": "HUF", "HU": "HUF",
+    "ROMANIA": "RON", "RO": "RON",
+    "BULGARIA": "BGN", "BG": "BGN",
+    "ICELAND": "ISK", "IS": "ISK",
+    "SERBIA": "RSD", "RS": "RSD",
+    "UKRAINE": "UAH", "UA": "UAH",
+    "RUSSIA": "RUB", "RU": "RUB",
+
+    # Africa
+    "SOUTH AFRICA": "ZAR", "ZA": "ZAR",
+    "MOROCCO": "MAD", "MA": "MAD",
+    "KENYA": "KES", "KE": "KES",
+    "NIGERIA": "NGN", "NG": "NGN",
+    "GHANA": "GHS", "GH": "GHS",
+    "TANZANIA": "TZS", "TZ": "TZS",
+    "UGANDA": "UGX", "UG": "UGX",
+    "MAURITIUS": "MUR", "MU": "MUR",
+    "SEYCHELLES": "SCR", "SC": "SCR",
 }
+
+# FIX 2 – map free-text currency words to ISO codes BEFORE the KNOWN_CURRENCIES check
+CURRENCY_WORD_MAP: Dict[str, str] = {
+    "EURO": "EUR", "EUROS": "EUR", "EUR": "EUR",
+    "US DOLLAR": "USD", "US DOLLARS": "USD", "DOLLAR": "USD", "DOLLARS": "USD",
+    "POUND": "GBP", "POUNDS": "GBP", "POUND STERLING": "GBP", "STERLING": "GBP",
+    "YEN": "JPY", "JAPANESE YEN": "JPY",
+    "YUAN": "CNY", "RENMINBI": "CNY", "RMB": "CNY",
+    "SWISS FRANC": "CHF", "FRANC": "CHF", "FRANCS": "CHF",
+    "CANADIAN DOLLAR": "CAD", "CANADIAN DOLLARS": "CAD",
+    "AUSTRALIAN DOLLAR": "AUD", "AUSTRALIAN DOLLARS": "AUD",
+    "HONG KONG DOLLAR": "HKD",
+    "MEXICAN PESO": "MXN", "PESO": "MXN",
+    "REAL": "BRL", "REAIS": "BRL", "BRL": "BRL",
+    "RUPEE": "INR", "RUPEES": "INR",
+    "KRONA": "SEK", "KRONE": "NOK",
+    "ZLOTY": "PLN",
+    "FORINT": "HUF",
+    "KORUNA": "CZK",
+    "LEU": "RON",
+    "DINAR": "RSD",
+    "DIRHAM": "AED",
+    "RIYAL": "SAR",
+    "SHEKEL": "ILS",
+    "BAHT": "THB",
+    "RINGGIT": "MYR",
+    "PESO ARGENTINO": "ARS",
+    "CORONA": "SEK",
+}
+
+def normalize_currency_word(raw: str) -> Optional[str]:
+    """
+    Convert free-text currency names to ISO-4217 codes.
+    Returns None if not recognised.
+    """
+    if not raw:
+        return None
+    s = raw.strip().upper()
+    # Direct ISO match
+    if re.fullmatch(r"[A-Z]{3}", s) and s in KNOWN_CURRENCIES:
+        return s
+    # Word-map lookup
+    mapped = CURRENCY_WORD_MAP.get(s)
+    if mapped:
+        return mapped
+    # Partial word match (e.g. "Euros" contained in key)
+    for word, code in CURRENCY_WORD_MAP.items():
+        if word in s or s in word:
+            return code
+    return None
+
+
+def get_currency_from_country(country_name: Optional[str]) -> Optional[str]:
+    """
+    Gets the currency code for a country using multiple fallback strategies:
+    1. Direct lookup in DEFAULT_CURRENCY_BY_COUNTRY (fast, pre-configured)
+    2. ISO2 code lookup in DEFAULT_CURRENCY_BY_COUNTRY
+    3. pycountry lookup (comprehensive, works for all countries)
+
+    Returns the 3-letter ISO-4217 currency code or None if not found.
+    """
+    if not country_name:
+        return None
+
+    try:
+        if pd.isna(country_name):
+            return None
+    except Exception:
+        pass
+
+    country_raw = str(country_name).strip()
+    if not country_raw or country_raw.upper() == "<NA>":
+        return None
+
+    country_norm = country_raw.upper()
+
+    # Strategy 1: Direct lookup by country name
+    if country_norm in DEFAULT_CURRENCY_BY_COUNTRY:
+        return DEFAULT_CURRENCY_BY_COUNTRY[country_norm]
+
+    # Strategy 2: Lookup by ISO2 code
+    try:
+        iso2_country = to_iso2(country_raw)
+        if iso2_country and iso2_country.upper() in DEFAULT_CURRENCY_BY_COUNTRY:
+            return DEFAULT_CURRENCY_BY_COUNTRY[iso2_country.upper()]
+    except Exception:
+        pass
+
+    # Strategy 3: Use pycountry to get currency (comprehensive fallback)
+    if pycountry:
+        try:
+            # Try to find the country
+            country_obj = None
+
+            # Try direct lookup by name or code
+            try:
+                country_obj = pycountry.countries.lookup(country_raw)
+            except Exception:
+                pass
+
+            # If we found a country, try to get its currency
+            if country_obj:
+                alpha_2 = getattr(country_obj, "alpha_2", None)
+                if alpha_2:
+                    # Try to find currency by country code
+                    # Note: pycountry doesn't have direct country->currency mapping
+                    # so we use a common ISO mapping
+                    try:
+                        # Import pycountry.currencies if available
+                        import pycountry
+
+                        # Common country code to currency mappings not in our dict
+                        iso_currency_map = {
+                            "AL": "ALL", "DZ": "DZD", "AO": "AOA", "AM": "AMD",
+                            "AZ": "AZN", "BD": "BDT", "BY": "BYN", "BZ": "BZD",
+                            "BO": "BOB", "BA": "BAM", "BW": "BWP", "BN": "BND",
+                            "KH": "KHR", "CM": "XAF", "CV": "CVE", "TD": "XAF",
+                            "CU": "CUP", "CD": "CDF", "DJ": "DJF", "EC": "USD",
+                            "SV": "USD", "ER": "ERN", "ET": "ETB", "FJ": "FJD",
+                            "GA": "XAF", "GM": "GMD", "GE": "GEL", "GN": "GNF",
+                            "GY": "GYD", "HT": "HTG", "HN": "HNL", "IQ": "IQD",
+                            "IR": "IRR", "KZ": "KZT", "KP": "KPW", "KG": "KGS",
+                            "LA": "LAK", "LB": "LBP", "LR": "LRD", "LY": "LYD",
+                            "MK": "MKD", "MG": "MGA", "MW": "MWK", "ML": "XOF",
+                            "MR": "MRU", "MN": "MNT", "MZ": "MZN", "MM": "MMK",
+                            "NA": "NAD", "NP": "NPR", "NI": "NIO", "NE": "XOF",
+                            "PK": "PKR", "PG": "PGK", "PY": "PYG", "RW": "RWF",
+                            "SN": "XOF", "SL": "SLL", "SO": "SOS", "SS": "SSP",
+                            "SD": "SDG", "SR": "SRD", "SZ": "SZL", "SY": "SYP",
+                            "TJ": "TJS", "TG": "XOF", "TT": "TTD", "TN": "TND",
+                            "TM": "TMT", "UY": "UYU", "UZ": "UZS", "VU": "VUV",
+                            "VE": "VES", "YE": "YER", "ZM": "ZMW", "ZW": "ZWL",
+                        }
+
+                        if alpha_2 in iso_currency_map:
+                            return iso_currency_map[alpha_2]
+
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # If all strategies fail, return None
+    return None
 
 
 # -------------------- DATE / VALUE HELPERS --------------------
@@ -1007,8 +1390,8 @@ def ocr_extract_full_text(pdf_path: Path) -> str:
 
 def strip_state_if_person_name(results: Dict[str, Optional[str]]) -> None:
     """
-    Se State/Province for igual ao First Name, Last Name ou "First Last", zera o campo.
-    Evita casos em que state vazio puxa nome de contato.
+    If State/Province equals First Name, Last Name, or "First Last", clears the field.
+    Avoids cases where empty state pulls contact name.
     """
     s = results.get("State/Province")
     if not s:
@@ -1109,10 +1492,22 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
         if d2 and not results["Effective Date of Change"]:
             results["Effective Date of Change"] = d2
 
+        # Regex fallback for Currency field
         if not results["Currency"]:
-            m = re.search(r"(?is)\bcurrency\s*:\s*([A-Za-z]{3})\b", full_text)
-            if m:
-                results["Currency"] = m.group(1).upper()
+            # Try multiple patterns to catch currency
+            patterns = [
+                r"(?is)\bcurrency\s*:?\s*([A-Za-z]{3})\b",  # "Currency: USD" or "Currency USD"
+                r"(?is)\bcurrency\s*:?\s*([A-Za-z ]{3,20})\b",  # "Currency: US Dollar"
+                r"(?is)\bcurrency\s*code\s*:?\s*([A-Za-z]{3})\b",  # "Currency Code: USD"
+            ]
+            for pattern in patterns:
+                m = re.search(pattern, full_text)
+                if m:
+                    raw_cur = m.group(1).strip()
+                    normalized = normalize_currency_word(raw_cur)
+                    if normalized:
+                        results["Currency"] = normalized
+                        break
 
         if not results["Country"]:
             m_same = re.search(r"(?im)^\s*country\s*:\s*(.+)$", full_text)
@@ -1121,20 +1516,20 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                 if val:
                     results["Country"] = val
 
-        # ------- Fallback por regex para campos restantes -------
+        # ------- Regex fallback for remaining fields -------
         for f in FIELDS:
             col = f["col"]
             if results.get(col):
                 continue
 
-            # Fallback controlado para State/Province:
+            # Controlled fallback for State/Province:
             if col == "State/Province":
                 found = None
                 specific_labels = [r"state\s*/\s*province", r"state\s*province"]
                 for lab in specific_labels:
-                    # 1) tenta na mesma linha do label
+                    # 1) try same line as label
                     found = try_same_line_block(full_text, lab)
-                    # 2) se não achar, usa o fallback ESPECÍFICO de State/Province
+                    # 2) if not found, use SPECIFIC State/Province fallback
                     if not found:
                         found = try_next_line_block_state(full_text, lab)
                     if found:
@@ -1168,13 +1563,16 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                     if m:
                         found = m.group(0)
             results[col] = found
-        # ------- fim fallback FIELDS -------
+        # ------- end FIELDS fallback -------
 
+        # --- FIX 2: normalize currency word before KNOWN_CURRENCIES check ---
         if results["Currency"]:
-            cur0 = results["Currency"].upper().strip()
-            results["Currency"] = cur0 if re.fullmatch(r"[A-Z]{3}", cur0) else None
+            raw_cur = str(results["Currency"]).strip()
+            # Try direct normalize first
+            resolved = normalize_currency_word(raw_cur)
+            results["Currency"] = resolved  # may be None if unrecognised – fallback below
 
-        # Limpa state se for igual a nome de contato
+        # Clear state if it equals contact name
         strip_state_if_person_name(results)
 
         # Only use sanitize_state_and_postal to handle obvious swaps;
@@ -1246,19 +1644,17 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
                 c = None
             results["Currency"] = c
 
+        # Final fallback: if currency is still None, derive from country
         if not results.get("Currency"):
             country_raw = (results.get("Country") or "").strip()
-            country_norm = country_raw.upper()
-            iso2_country = None
-            try:
-                iso2_country = to_iso2(country_raw) or ""
-            except Exception:
-                iso2_country = ""
-            cur_final = (
-                    DEFAULT_CURRENCY_BY_COUNTRY.get(country_norm)
-                    or DEFAULT_CURRENCY_BY_COUNTRY.get(iso2_country.upper(), None)
-            )
-            results["Currency"] = cur_final
+            if country_raw:
+                cur_final = get_currency_from_country(country_raw)
+                results["Currency"] = cur_final
+                if debug := False:  # Enable for debugging currency issues
+                    if cur_final:
+                        print(f"[DEBUG] Currency derived from country '{country_raw}': {cur_final}")
+                    else:
+                        print(f"[WARN] Could not derive currency for country: '{country_raw}'")
 
         translit_fields = {
             "First Name",
@@ -1356,6 +1752,17 @@ def normalize_hotel_name_for_sql(val: Optional[str]) -> Optional[str]:
     s = s.replace("&", " AND ")
     s = re.sub(r"[^A-Z0-9 ]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
+
+    # Safety check: reject names that are too short (likely to cause false matches)
+    # Must have at least 3 characters after normalization
+    if len(s) < 3:
+        return None
+
+    # Safety check: reject common generic terms that would cause false matches
+    generic_terms = {"INC", "LLC", "LTD", "CORP", "CO", "THE", "AND", "SA", "SPA",
+                     "GMBH", "SRL", "BV", "NV", "AG", "PLC", "PTY"}
+    if s in generic_terms:
+        return None
 
     return s or None
 
@@ -1518,7 +1925,7 @@ def unprotect_workbook_and_sheets(wb, debug: bool = False):
 
 
 def _is_blank(val) -> bool:
-    """True para None, string vazia ou NaN."""
+    """True for None, empty string, or NaN."""
     if val is None:
         return True
     if isinstance(val, str) and val.strip() == "":
@@ -1588,97 +1995,301 @@ def fetch_oracle_tca(expedia_ids: List[str]) -> pd.DataFrame:
 
     return df_oracle
 
-def fetch_oracle_hotels_by_name(hotel_names: List[str]) -> pd.DataFrame:
-    hotel_names = sorted({
+# FIX 1 – pass country_iso2_list so we match (name, country) in Oracle
+def fetch_oracle_hotels_by_name(hotel_names: List[str], country_iso2_list: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Queries Oracle for SLE records matching the given hotel/legal names.
+
+    FIX 1: The result is now deduplicated on (HOTEL_NAME_MATCH, COUNTRY_ABBR)
+    when country info is available, preventing the wrong SLE OID from being
+    returned when the same legal name appears in more than one country.
+
+    The SQL already returns COUNTRY_ABBR, so no schema change is needed.
+    """
+    hotel_names_norm = sorted({
         normalize_hotel_name_for_sql(x)
         for x in hotel_names
         if normalize_hotel_name_for_sql(x)
     })
-
-    if not hotel_names:
+    if not hotel_names_norm:
+        print("[INFO] No valid hotel names for SLE OID lookup (all filtered out).")
         return pd.DataFrame()
 
-    names_literal = ", ".join("'" + n.replace("'", "''") + "'" for n in hotel_names)
+    # Safety check: warn if we're searching for very short names
+    short_names = [n for n in hotel_names_norm if len(n) < 5]
+    if short_names:
+        print(f"[WARN] Some normalized legal names are very short and may cause false matches: {short_names[:5]}")
+
+    names_literal = ", ".join("'" + n.replace("'", "''") + "'" for n in hotel_names_norm)
     sql = ORACLE_HOTEL_BY_NAME_SQL_TEMPLATE.format(hotel_names=names_literal)
-
-    print(f"\n[INFO] Running Oracle hotel-name query for {len(hotel_names)} hotel name(s)...")
-
+    print(f"\n[INFO] Running Oracle hotel-name query for {len(hotel_names_norm)} hotel name(s)...")
     ensure_oracle_client()
-
     with oracledb.connect(user=ORACLE_USERNAME, password=ORACLE_PASSWORD, dsn=ORACLE_DSN) as con:
         with con.cursor() as cur:
             cur.execute("ALTER SESSION SET CURRENT_SCHEMA = APPS")
-
         t0 = time.time()
         with con.cursor() as cur:
             cur.execute(sql)
             cols = [d[0] for d in cur.description]
             rows = cur.fetchall()
         elapsed = time.time() - t0
-
     print(f"[INFO] Oracle hotel-name query completed. Rows: {len(rows)}. Time: {elapsed:.2f}s")
 
+    # Warning if we got way too many results (possible false match scenario)
+    if len(rows) > 100:
+        print(f"[WARN] Oracle returned {len(rows)} SLE records. This may indicate overly broad name matching.")
+
     df_oracle = pd.DataFrame(rows, columns=cols)
+    if df_oracle.empty:
+        return df_oracle
 
-    if not df_oracle.empty:
-        df_oracle["HOTEL_NAME_MATCH"] = df_oracle["HOTEL_NAME"].apply(normalize_name_for_match)
-        df_oracle["COUNTRY_ABBR"] = df_oracle["COUNTRY_ABBR"].astype(str).str.strip().str.upper()
+    df_oracle["HOTEL_NAME_MATCH"] = df_oracle["HOTEL_NAME"].apply(normalize_name_for_match)
+    df_oracle["COUNTRY_ABBR"] = df_oracle["COUNTRY_ABBR"].astype(str).str.strip().str.upper()
+    df_oracle = df_oracle.sort_values(["HOTEL_NAME_MATCH", "COUNTRY_ABBR", "ORACLE_ID"])
 
-        df_oracle = df_oracle.sort_values(["HOTEL_NAME_MATCH", "ORACLE_ID"])
-        df_oracle = df_oracle.drop_duplicates(
-            subset=["HOTEL_NAME_MATCH"],
-            keep="first"
+    if country_iso2_list:
+        # Build a set of (name_norm, iso2) pairs from the HCPIF for guided deduplication
+        hcpif_pairs = set()
+        for name, iso2 in zip(
+            [normalize_hotel_name_for_sql(x) for x in hotel_names],
+            [str(c).strip().upper() if c else "" for c in country_iso2_list]
+        ):
+            if name:
+                hcpif_pairs.add((name, iso2))
+
+        # Prefer the row whose COUNTRY_ABBR matches the HCPIF country; fall back to first row
+        def _pick_best(group):
+            # First pass: exact country match
+            for idx in group.index:
+                name_match = group.loc[idx, "HOTEL_NAME_MATCH"]
+                country = group.loc[idx, "COUNTRY_ABBR"]
+                if (name_match, country) in hcpif_pairs:
+                    return group.loc[[idx]]
+
+            # Second pass: if no exact match and group has multiple countries,
+            # prefer the one with an Expedia ID (more likely to be a real hotel account)
+            if len(group) > 1:
+                with_eid = group[group["EXPEDIA_ID"].notna() & (group["EXPEDIA_ID"].astype(str).str.strip() != "")]
+                if not with_eid.empty:
+                    return with_eid.iloc[[0]]
+
+            # Final fallback: first row (alphabetical by country)
+            return group.iloc[[0]]
+
+        df_oracle = (
+            df_oracle.groupby("HOTEL_NAME_MATCH", group_keys=False)
+            .apply(_pick_best, include_groups=True)
+            .reset_index(drop=True)
         )
+    else:
+        # Legacy behaviour: deduplicate on name only
+        df_oracle = df_oracle.drop_duplicates(subset=["HOTEL_NAME_MATCH"], keep="first")
 
     return df_oracle
 
 def add_sle_oid_from_legal_name(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    FIX 1: pass both Legal Name AND Country ISO2 to fetch_oracle_hotels_by_name
+    so that when the same SLE name exists in multiple countries the correct OID
+    (matching the HCPIF country) is selected.
+
+    Also adds a validation column to flag suspicious matches.
+    """
     if "Legal Name" not in df.columns:
         return df
 
     df = df.copy()
 
-    oracle_base = fetch_oracle_hotels_by_name(df["Legal Name"].tolist())
+    # Gather country ISO2 list aligned with Legal Name list
+    country_iso2_list: Optional[List[str]] = None
+    if "Country ISO2" in df.columns:
+        country_iso2_list = df["Country ISO2"].tolist()
+    elif "Country" in df.columns:
+        country_iso2_list = [to_iso2(c) or "" for c in df["Country"].tolist()]
+
+    oracle_base = fetch_oracle_hotels_by_name(
+        df["Legal Name"].tolist(),
+        country_iso2_list=country_iso2_list,
+    )
+
+    insert_pos = list(df.columns).index("Legal Name") + 1 if "Legal Name" in df.columns else len(df.columns)
+
     if oracle_base.empty:
-        insert_pos = list(df.columns).index("Legal Name") + 1 if "Legal Name" in df.columns else len(df.columns)
         if "SLE OID" not in df.columns:
             df.insert(loc=insert_pos, column="SLE OID", value=pd.NA)
+            df.insert(loc=insert_pos + 1, column="SLE Match Status", value=pd.NA)
         return df
 
     df["LEGAL_NAME_MATCH"] = df["Legal Name"].apply(normalize_name_for_match)
 
+    # Add HCPIF country for secondary match
+    if country_iso2_list:
+        df["_HCPIF_ISO2"] = [str(c).strip().upper() if c else "" for c in country_iso2_list]
+    else:
+        df["_HCPIF_ISO2"] = ""
+
+    # Keep the Oracle country in the merge for validation
     match_df = df.merge(
-        oracle_base[["HOTEL_NAME_MATCH", "ORACLE_ID"]],
+        oracle_base[["HOTEL_NAME_MATCH", "COUNTRY_ABBR", "ORACLE_ID", "EXPEDIA_ID"]],
         how="left",
-        left_on=["LEGAL_NAME_MATCH"],
-        right_on=["HOTEL_NAME_MATCH"],
+        left_on=["LEGAL_NAME_MATCH", "_HCPIF_ISO2"],
+        right_on=["HOTEL_NAME_MATCH", "COUNTRY_ABBR"],
+        suffixes=("", "_ORACLE")
     )
 
-    insert_pos = list(df.columns).index("Legal Name") + 1
+    # Track which rows got country-matched vs name-only matched
+    match_df["_COUNTRY_MATCHED"] = match_df["ORACLE_ID"].notna()
+
+    # If country-keyed merge left some rows unmatched, try name-only fallback for those rows
+    if "ORACLE_ID" in match_df.columns:
+        no_match_mask = match_df["ORACLE_ID"].isna()
+        if no_match_mask.any():
+            name_only = oracle_base.drop_duplicates(subset=["HOTEL_NAME_MATCH"], keep="first")
+            fallback = (
+                df.loc[no_match_mask, ["LEGAL_NAME_MATCH"]]
+                .merge(name_only[["HOTEL_NAME_MATCH", "ORACLE_ID", "COUNTRY_ABBR", "EXPEDIA_ID"]],
+                       how="left",
+                       left_on="LEGAL_NAME_MATCH",
+                       right_on="HOTEL_NAME_MATCH")
+            )
+            match_df.loc[no_match_mask, "ORACLE_ID"] = fallback["ORACLE_ID"].values
+            match_df.loc[no_match_mask, "COUNTRY_ABBR"] = fallback["COUNTRY_ABBR"].values
+            match_df.loc[no_match_mask, "EXPEDIA_ID_ORACLE"] = fallback["EXPEDIA_ID"].values
+
+    # Create validation status column
+    def _validate_sle_match(row):
+        if pd.isna(row.get("ORACLE_ID")) or str(row.get("ORACLE_ID")).strip() == "":
+            return "No SLE Found"
+
+        # Check if country matched
+        hcpif_country = str(row.get("_HCPIF_ISO2", "")).strip().upper()
+        oracle_country = str(row.get("COUNTRY_ABBR", "")).strip().upper()
+
+        if hcpif_country and oracle_country and hcpif_country != oracle_country:
+            return f"Country Mismatch (HCPIF: {hcpif_country}, Oracle: {oracle_country})"
+
+        # Check if the normalized name is very short (higher risk of false match)
+        norm_name = str(row.get("LEGAL_NAME_MATCH", "")).strip()
+        if len(norm_name) < 5:
+            return f"Short Name Match (length {len(norm_name)}) - Review"
+
+        # Good match
+        if row.get("_COUNTRY_MATCHED"):
+            return "Match (Name + Country)"
+        else:
+            return "Match (Name Only) - Review if country important"
+
+    match_df["SLE Match Status"] = match_df.apply(_validate_sle_match, axis=1)
+
+    # Drop existing columns before inserting at specific position
     if "SLE OID" in match_df.columns:
         match_df = match_df.drop(columns=["SLE OID"])
 
-    match_df.insert(loc=insert_pos, column="SLE OID", value=match_df["ORACLE_ID"])
+    # Store SLE Match Status values before dropping
+    sle_match_status_values = match_df["SLE Match Status"]
+    if "SLE Match Status" in match_df.columns:
+        match_df = match_df.drop(columns=["SLE Match Status"])
+
+    # Insert columns at desired positions
+    match_df.insert(loc=insert_pos, column="SLE OID", value=match_df.get("ORACLE_ID", pd.NA))
+    match_df.insert(loc=insert_pos + 1, column="SLE Match Status", value=sle_match_status_values)
 
     match_df = match_df.drop(
-        columns=["LEGAL_NAME_MATCH", "HOTEL_NAME_MATCH", "ORACLE_ID"],
+        columns=["LEGAL_NAME_MATCH", "HOTEL_NAME_MATCH", "ORACLE_ID", "COUNTRY_ABBR",
+                 "_HCPIF_ISO2", "_COUNTRY_MATCHED", "EXPEDIA_ID_ORACLE"],
         errors="ignore",
     )
-
     return match_df
+
+def create_sle_match_review_tab(df: pd.DataFrame, df_oracle: pd.DataFrame) -> pd.DataFrame:
+    """
+    Creates a review tab for rows where the HCPIF data matches an existing SLE in Oracle.
+
+    Flags rows where:
+    - SLE OID exists
+    - Legal Name matches Oracle SLE_NAME (normalized)
+    - Country matches Oracle COUNTRY_ABBR
+
+    Returns DataFrame with flagged rows for coordinator review.
+    """
+    if df_oracle.empty or "SLE OID" not in df.columns:
+        return pd.DataFrame()
+
+    # Only check rows that have an SLE OID
+    df_with_sle = df[df["SLE OID"].notna() & (df["SLE OID"].astype(str).str.strip() != "")].copy()
+
+    if df_with_sle.empty:
+        return pd.DataFrame()
+
+    # Merge with Oracle data to get SLE_NAME and COUNTRY_ABBR
+    df_with_sle["SLE OID"] = df_with_sle["SLE OID"].astype(str).str.strip()
+
+    # Create a lookup from Oracle data (SLE OID -> SLE_NAME, COUNTRY_ABBR)
+    oracle_sle_lookup = {}
+    if "SLE_OID" in df_oracle.columns and "SLE_NAME" in df_oracle.columns and "COUNTRY_ABBR" in df_oracle.columns:
+        for _, row in df_oracle.iterrows():
+            sle_oid = str(row.get("SLE_OID", "")).strip()
+            sle_name = str(row.get("SLE_NAME", "")).strip()
+            country = str(row.get("COUNTRY_ABBR", "")).strip().upper()
+            if sle_oid and sle_oid not in ("", "nan", "None"):
+                oracle_sle_lookup[sle_oid] = {
+                    "SLE_NAME": sle_name,
+                    "COUNTRY_ABBR": country
+                }
+
+    if not oracle_sle_lookup:
+        print("[INFO] No Oracle SLE data available for match review.")
+        return pd.DataFrame()
+
+    # Check for matches
+    matches = []
+    for idx, row in df_with_sle.iterrows():
+        sle_oid = str(row.get("SLE OID", "")).strip()
+        hcpif_legal_name = str(row.get("Legal Name", "")).strip()
+        hcpif_country_iso2 = str(row.get("Country ISO2", "")).strip().upper()
+
+        if sle_oid in oracle_sle_lookup:
+            oracle_data = oracle_sle_lookup[sle_oid]
+            oracle_sle_name = oracle_data["SLE_NAME"]
+            oracle_country = oracle_data["COUNTRY_ABBR"]
+
+            # Normalize for comparison
+            hcpif_name_norm = normalize_name_for_match(hcpif_legal_name)
+            oracle_name_norm = normalize_name_for_match(oracle_sle_name)
+
+            # Check if name and country match
+            name_match = hcpif_name_norm == oracle_name_norm if hcpif_name_norm and oracle_name_norm else False
+            country_match = hcpif_country_iso2 == oracle_country if hcpif_country_iso2 and oracle_country else False
+
+            if name_match and country_match:
+                # This is a potential duplicate/already exists scenario
+                row_copy = row.copy()
+                row_copy["Oracle SLE Name"] = oracle_sle_name
+                row_copy["Oracle Country"] = oracle_country
+                row_copy["Match Reason"] = "Legal Name + Country match existing SLE - Review before processing"
+                matches.append(row_copy)
+
+    if not matches:
+        print("[INFO] No SLE matches found requiring review.")
+        return pd.DataFrame()
+
+    df_review = pd.DataFrame(matches)
+    print(f"[INFO] {len(df_review)} row(s) flagged for SLE match review.")
+    return df_review
+
 
 def enrich_hcpif_with_oracle(
         df: pd.DataFrame, base_columns: List[str]
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if "Expedia ID" not in df.columns:
         print("[WARN] Column 'Expedia ID' not found; skipping Oracle enrichment.")
-        return df, pd.DataFrame(), pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     expedia_ids = df["Expedia ID"].tolist()
     df_oracle = fetch_oracle_tca(expedia_ids)
     if df_oracle.empty:
         print("[INFO] No Oracle data returned; HCPIF remains without enrichment.")
-        return df, pd.DataFrame(), pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     df["Expedia ID"] = df["Expedia ID"].astype(str).str.strip()
     if "Country ISO2" not in df.columns:
@@ -1695,7 +2306,7 @@ def enrich_hcpif_with_oracle(
         suffixes=("", "_ORACLE"),
     )
 
-    # ── FALLBACK: se não casou por country, tenta só pelo Expedia ID ──
+    # ── FALLBACK: if no match by country, try by Expedia ID only ──
     mask_no_match = merged["ORACLE_ID"].isna() if "ORACLE_ID" in merged.columns else pd.Series([False] * len(merged))
     if mask_no_match.any():
         df_oracle_by_eid = df_oracle.drop_duplicates(subset=["EXPEDIA_ID"], keep="first")
@@ -1716,7 +2327,7 @@ def enrich_hcpif_with_oracle(
         for col in oracle_fill_cols:
             if col in fallback.columns and col in merged.columns:
                 merged.loc[mask_no_match, col] = fallback[col].values
-    # ── fim fallback ──
+    # ── end fallback ──
 
     merged["Found Hotel OID"] = merged["ORACLE_ID"]
     merged["Found Hotel Name"] = merged["HOTEL_NAME"]
@@ -1787,10 +2398,26 @@ def enrich_hcpif_with_oracle(
 
     if not df_excluded_raw.empty:
         print(
-            f"[INFO] {len(df_excluded_raw)} row(s) flagged for review due to "
-            "RECEIPT_METHOD_NAME DIRECT DEBIT and/or TAI_BM GROUP. "
-            "They remain in the main Extraction sheet and WEBADI."
+            f"[INFO] {len(df_excluded_raw)} row(s) flagged for DIRECT DEBIT/TAI_BM GROUP review."
         )
+
+    # --- FIX 3: NO OID - EC tab ---
+    # Rows where BOTH Found Hotel OID (Hotel OID from TCA query) AND SLE OID are blank,
+    # AND the business model is NOT GROUP (i.e. Expedia Collect / Direct).
+    has_hotel_oid = merged["Found Hotel OID"].notna() & (merged["Found Hotel OID"].astype(str).str.strip() != "")
+    has_sle_oid = False  # default
+    if "SLE OID" in merged.columns:
+        has_sle_oid = merged["SLE OID"].notna() & (merged["SLE OID"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]) == False)
+    elif "SLE_OID" in merged.columns:
+        has_sle_oid = merged["SLE_OID"].notna() & (merged["SLE_OID"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]) == False)
+
+    mask_no_oid_at_all = (~has_hotel_oid) & (~has_sle_oid if isinstance(has_sle_oid, pd.Series) else True)
+    mask_not_group = ~series_tai.str.contains("GROUP", case=False, na=False)
+    mask_no_oid_ec = mask_no_oid_at_all & mask_not_group
+
+    df_no_oid_ec_raw = merged[mask_no_oid_ec].copy()
+    if not df_no_oid_ec_raw.empty:
+        print(f"[INFO] {len(df_no_oid_ec_raw)} row(s) flagged for 'NO OID - EC' review tab.")
 
     extra_cols = ["Found Hotel OID", "Found Hotel Name", "Oracle Currency", "Currency Matches Oracle", "Comments",
                   "Current RM"]
@@ -1801,16 +2428,21 @@ def enrich_hcpif_with_oracle(
 
     df_main = df_main_raw.loc[:, final_main_cols].copy()
     df_excluded = df_excluded_raw.loc[:, final_main_cols].copy()
+    df_no_oid_ec = df_no_oid_ec_raw.loc[:, final_main_cols].copy() if not df_no_oid_ec_raw.empty else pd.DataFrame()
 
-    return df_main, df_excluded, df_oracle_details
+    # Create SLE match review tab
+    df_sle_review = create_sle_match_review_tab(df_main, df_oracle)
+
+    return df_main, df_excluded, df_oracle_details, df_no_oid_ec, df_sle_review
 
 
 def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
     """
-    Converte a linguagem (string) em código ISO 639-1 de 2 letras (EN, PT, ES, ...).
-    - Usa pycountry.languages como fonte principal (padrão internacional).
-    - Aceita nomes ('English', 'Portuguese (Brazil)'), códigos com região ('en-US', 'pt_BR').
-    - Se não reconhecer com segurança, retorna None (fica em branco no WEBADI).
+    Converts language (string) to ISO 639-1 2-letter code (EN, PT, ES, ...).
+    - Uses pycountry.languages as primary source (international standard).
+    - Accepts names ('English', 'Portuguese (Brazil)'), codes with region ('en-US', 'pt_BR').
+    - Returns uppercase codes for consistency with Oracle EBS.
+    - If not recognized with confidence, returns None (leaves blank in WEBADI).
     """
     if val is None:
         return None
@@ -1819,19 +2451,35 @@ def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
     if not s_raw:
         return None
 
-    # Normaliza acentos e caixa
+    # Normalize accents and case
     s = unidecode(s_raw).strip()
 
-    # 1) Já vier um código tipo "en", "EN", "pt", etc.
+    # 1) Already a code like "en", "EN", "pt", etc.
     if len(s) == 2 and s.isalpha():
-        return s.upper()
+        code = s.upper()
+        # Validate it's a real language code
+        if pycountry is not None:
+            try:
+                pycountry.languages.get(alpha_2=code.lower())
+                return code
+            except:
+                pass
+        return code
 
-    # 2) Pega prefixo de 2 letras antes de "-" ou "_" (ex: "en-US", "pt_BR", "en (US)")
+    # 2) Get 2-letter prefix before "-" or "_" (e.g., "en-US", "pt_BR", "en (US)")
     m = re.match(r"\s*([A-Za-z]{2})\b", s)
     if m:
-        return m.group(1).upper()
+        code = m.group(1).upper()
+        # Validate it's a real language code
+        if pycountry is not None:
+            try:
+                pycountry.languages.get(alpha_2=code.lower())
+                return code
+            except:
+                pass
+        return code
 
-    # 3) Tenta lookup pelo pycountry (nome, alpha_2, alpha_3, bibliographic, etc.)
+    # 3) Try lookup via pycountry (name, alpha_2, alpha_3, bibliographic, etc.)
     if pycountry is not None:
         try:
             lang = pycountry.languages.lookup(s.lower())
@@ -1841,7 +2489,8 @@ def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
         except Exception:
             pass
 
-    # 4) Fallback manual para nomes comuns (em inglês/português/espanhol)
+    # 4) Manual fallback for common names (in English/Portuguese/Spanish)
+    # Only use these as last resort if pycountry lookup failed
     s_low = s.lower()
     if "english" in s_low:
         return "EN"
@@ -1855,8 +2504,8 @@ def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
         return "DE"
     if "italian" in s_low or "italiano" in s_low:
         return "IT"
-    if "dutch" in s_low or "holandes" in s_low:
-        return "NL"
+    if "dutch" in s_low or "holandes" in s_low or "neerlandes" in s_low:
+        return "NL"  # Dutch = NL (ISO 639-1 standard)
     if "japanese" in s_low or "japones" in s_low:
         return "JA"
     if "chinese" in s_low or "mandarin" in s_low:
@@ -1866,11 +2515,11 @@ def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
     if "russian" in s_low:
         return "RU"
 
-    # Se não conseguiu mapear com segurança, deixa em branco no WEBADI
+    # If could not map with confidence, leave blank in WEBADI
     return None
 
 
-def inject_into_webadi(
+def inject_into_webadi_update(
         template_path: Path,
         out_path: Optional[Path],
         df: pd.DataFrame,
@@ -1881,16 +2530,14 @@ def inject_into_webadi(
         unprotect: bool = True,
 ):
     """
-    Preenche o WEBADI com base no df (já enriquecido com WEBADI_COUNTRY / WEBADI_TAX_*).
+    Fills the OC WEBADI UPDATE template.
 
-    Campos especiais:
-      - COUNTRY (coluna AA)        <- df["WEBADI_COUNTRY"]
-      - TAX_REGIME_CODE (coluna L) <- df["WEBADI_TAX_REGIME_CODE"]
-      - TAX (coluna M)             <- df["WEBADI_TAX"]
-      - TAX_REG_STATUS (coluna N)  <- "REGISTERED" se df["Tax Registration Status"] contiver "REGISTERED"
+    Includes: Tax info, payment method, currency
+    ACTION = "Update"
+    GROUP_PARENT_SLE_ACCOUNT_NUMBER = SLE OID
     """
     if not template_path.exists():
-        raise FileNotFoundError(f"WEBADI template not found: {template_path}")
+        raise FileNotFoundError(f"WEBADI UPDATE template not found: {template_path}")
 
     wb = load_workbook(
         str(template_path),
@@ -1911,14 +2558,12 @@ def inject_into_webadi(
         raise RuntimeError(f"Sheet '{sheet_name}' not found in template.")
     ws = wb[sheet_name]
 
-    # Atualiza BATCH_NAME em E3 se o template estiver com "*TEXT"
+    # Update BATCH_NAME in E3 with today's date
     try:
-        d3 = ws["D3"].value
-        if isinstance(d3, str) and d3.strip().lower().replace(" ", "") == "*text":
-            today_str = datetime.now().strftime("%m%d%Y")
-            ws["E3"].value = f"OC {today_str}"
-            if debug:
-                print(f"[DEBUG] E3 (BATCH_NAME) set to 'OC {today_str}'")
+        today_str = datetime.now().strftime("%m/%d/%Y")
+        ws["E3"].value = f"OC WEBADI UPDATE {today_str}"
+        if debug:
+            print(f"[DEBUG] E3 (BATCH_NAME) set to 'OC WEBADI UPDATE {today_str}'")
     except Exception as e:
         if debug:
             print(f"[DEBUG] Failed to update BATCH_NAME in E3: {e}")
@@ -1927,54 +2572,48 @@ def inject_into_webadi(
         ws, start_at_row=header_start_row, debug=debug
     )
 
-    # Mapeamento: header normalizado do WEBADI -> coluna do df
+    if debug:
+        print(f"[DEBUG] UPDATE WebADI: Found {len(header_map)} headers in template:")
+        for norm_name, col_idx in sorted(header_map.items()):
+            print(f"  {norm_name} → Column {col_idx}")
+
+    # Mapping: normalized WEBADI header -> df column (UPDATE template includes tax info)
     wanted = {
+        "GROUP_PARENT_SLE_ACCOUNT_NUMBER": "SLE OID",
         "HOTEL_ID": "Expedia ID",
+        "EFFECTIVE_DATE": "Effective Date of Change",
         "CUSTOMER_NAME": "Hotel Name",
-        "ADDRESS_LINE_1": "Address Line 1",
+        "TAX_REG_NUM": "Tax Registration Number",
+        "TAX_REGIME_CODE": "WEBADI_TAX_REGIME_CODE",
+        "TAX": "WEBADI_TAX",
+        "TAX_REG_STATUS": "Tax Registration Status",
+        "ADDRESS_LINE_1": "Address Line 1",  # Changed from ADDRESS1 to match OID Creation
         "CITY": "City",
         "POSTAL_CODE": "Postal Code",
-        # COUNTY (se quiser manter como o Country original do HCPIF)
         "COUNTRY": "WEBADI_COUNTRY",
-        # TAX_REGIME_CODE (L): Tax Regime Code do VLOOKUP
-        "TAX_REGIME_CODE": "WEBADI_TAX_REGIME_CODE",
-        # TAX (M): Tax do VLOOKUP
-        "TAX": "WEBADI_TAX",
-        # TAX_REG_STATUS (N): status vindo do HCPIF Extraction
-        "TAX_REG_STATUS": "Tax Registration Status",
+        "PAYMENT_METHOD": "Current RM",
         "BILLING_CURRENCY": "Currency",
         "FIRST_NAME": "First Name",
         "LAST_NAME": "Last Name",
         "EMAIL_ADDRESS": "Email Address",
-        "TAX_REG_NUMBER": "Tax Registration Number",
-        "EFFECTIVE_DATE": "Effective Date of Change",
         "PREFERRED_LANGUAGE": "Preferred Language",
+        "COMMENTS": "file_name",  # Will be converted to comment format
     }
 
     col_state = header_map.get("STATE")
     col_province = header_map.get("PROVINCE")
-    col_bill_to = header_map.get("BILL_TO")
-    col_current_rm = column_index_from_string("AB")
-    col_others = column_index_from_string("J")
-    col_comments = column_index_from_string("AP")
-
-    if not col_bill_to:
-        col_bill_to = column_index_from_string("Q")
-        if debug:
-            print(
-                "[DEBUG] BILL_TO column not found by header; "
-                "using fallback column Q."
-            )
-
     col_site_purpose = header_map.get("SITE_PURPOSE")
+    col_action = header_map.get("ACTION")
+    col_upl = column_index_from_string("B")
+    col_tax_reg_type = header_map.get("TAX_REG_TYPE")
 
     key_col = header_map.get("HOTEL_ID") or header_map.get("CUSTOMER_NAME")
     if not key_col:
         raise RuntimeError(
-            "Could not find key columns (HOTEL_ID/CUSTOMER_NAME) in WebADI header."
+            "Could not find key columns (HOTEL_ID/CUSTOMER_NAME) in UPDATE WebADI header."
         )
 
-    # Limpa ou clona linhas conforme o modo
+    # Clear or clone rows according to mode
     if mode.lower() == "replace":
         last = ws.max_row
         for _ in range(header_row + 1, last + 1):
@@ -2001,49 +2640,43 @@ def inject_into_webadi(
         src_row = base_row if base_row > header_row else header_row + 1
         clone_row(ws, src_row, current)
 
-        # Sempre sobrescreve BILL_TO e SITE_PURPOSE
-        if col_bill_to:
-            ws.cell(current, col_bill_to).value = "BILL_TO"
+        # Set fixed columns for UPDATE template
+        ws.cell(current, col_upl).value = "O"
+        if col_action:
+            ws.cell(current, col_action).value = "Update"
         if col_site_purpose:
             ws.cell(current, col_site_purpose).value = "BILL_TO"
+        if col_tax_reg_type:
+            ws.cell(current, col_tax_reg_type).value = "Others"
 
-        ws.cell(current, col_others).value = "Others"
-
-        # Zera sempre STATE/PROVINCE nas linhas novas para não herdar lixo
+        # Always clear STATE/PROVINCE in new rows to avoid inheriting junk
         if col_state:
             ws.cell(current, col_state).value = None
         if col_province:
             ws.cell(current, col_province).value = None
 
-        # Preenche colunas conforme mapeamento
+        # Fill columns according to mapping
         for webadi_col, script_col in wanted.items():
             col_idx = header_map.get(webadi_col)
             if not col_idx:
+                if debug:
+                    print(f"[DEBUG] Column '{webadi_col}' not found in template header, skipping")
                 continue
             val = rec.get(script_col)
+            if debug and webadi_col in ["FIRST_NAME", "LAST_NAME", "EMAIL_ADDRESS", "ADDRESS_LINE_1"]:
+                print(f"[DEBUG] Filling {webadi_col} (col {col_idx}) with value: {val}")
 
-            # COUNTRY (AA): país vindo do VLOOKUP (WEBADI_COUNTRY)
-            if webadi_col == "COUNTRY":
-                if _is_blank(val):
-                    ws.cell(current, col_idx).value = None
+            # COMMENTS: Format as "filename Updated per HCPIF - update hotel name, address, tax, contact"
+            # Note: file_name already contains Expedia IDs, so don't duplicate them
+            if webadi_col == "COMMENTS":
+                file_name = rec.get("file_name", "")
+                if not _is_blank(file_name):
+                    comment_text = f"{file_name} Updated per HCPIF - update hotel name, address, tax, contact"
+                    ws.cell(current, col_idx).value = comment_text
                 else:
-                    ws.cell(current, col_idx).value = val
-
-            # TAX_REGIME_CODE (L): Tax Regime Code do VLOOKUP
-            elif webadi_col == "TAX_REGIME_CODE":
-                if _is_blank(val):
                     ws.cell(current, col_idx).value = None
-                else:
-                    ws.cell(current, col_idx).value = val
 
-            # TAX (M): Tax do VLOOKUP
-            elif webadi_col == "TAX":
-                if _is_blank(val):
-                    ws.cell(current, col_idx).value = None
-                else:
-                    ws.cell(current, col_idx).value = val
-
-            # TAX_REG_STATUS (N): 'REGISTERED' se vier assim do HCPIF Extraction
+            # TAX_REG_STATUS: "REGISTERED" if contains "REGISTERED"
             elif webadi_col == "TAX_REG_STATUS":
                 if _is_blank(val):
                     ws.cell(current, col_idx).value = None
@@ -2051,7 +2684,7 @@ def inject_into_webadi(
                     s = str(val).strip().upper()
                     ws.cell(current, col_idx).value = "REGISTERED" if "REGISTERED" in s else None
 
-            # Moeda: 3 letras ou, se não tiver valor, limpa.
+            # Currency: 3 letters or blank
             elif webadi_col == "BILLING_CURRENCY":
                 if _is_blank(val):
                     ws.cell(current, col_idx).value = None
@@ -2061,36 +2694,36 @@ def inject_into_webadi(
                     else:
                         ws.cell(current, col_idx).value = val
 
-            # Preferred Language: converte para código de 2 letras.
-            elif webadi_col == "PREFERRED_LANGUAGE":
+            # EFFECTIVE_DATE: Format as '15/Feb/2026' (DD/MMM/YYYY)
+            elif webadi_col == "EFFECTIVE_DATE":
                 if _is_blank(val):
                     ws.cell(current, col_idx).value = None
                 else:
-                    code = normalize_language_to_code(val)
-                    ws.cell(current, col_idx).value = code if code else None
+                    # Try to parse and reformat the date
+                    try:
+                        if isinstance(val, datetime):
+                            formatted_date = val.strftime("%d/%b/%Y")
+                            ws.cell(current, col_idx).value = formatted_date
+                        elif isinstance(val, str):
+                            # Try to parse string date
+                            from dateutil import parser
+                            parsed_date = parser.parse(val)
+                            formatted_date = parsed_date.strftime("%d/%b/%Y")
+                            ws.cell(current, col_idx).value = formatted_date
+                        else:
+                            ws.cell(current, col_idx).value = val
+                    except:
+                        # If parsing fails, write as-is
+                        ws.cell(current, col_idx).value = val
 
-            # Demais campos (inclui TAX_REG_NUMBER, ADDRESS_LINE_1, etc.)
+            # All other fields
             else:
                 if _is_blank(val):
                     ws.cell(current, col_idx).value = None
                 else:
                     ws.cell(current, col_idx).value = val
 
-        # Current RM -> coluna AB
-        val_current_rm = rec.get("Current RM")
-        if _is_blank(val_current_rm):
-            ws.cell(current, col_current_rm).value = None
-        else:
-            ws.cell(current, col_current_rm).value = val_current_rm
-
-        # COMMENTS From HCPIF Extraction
-        val_comments = rec.get("Comments")
-        if _is_blank(val_comments):
-            ws.cell(current, col_comments).value = None
-        else:
-            ws.cell(current, col_comments).value = str(val_comments).strip()
-
-        # Preencher State/Province no WebADI, após limpar as colunas acima
+        # Fill State/Province in WebADI, after clearing the columns above
         if not _is_blank(stateprov) and isinstance(stateprov, str):
             if iso2 == "CA" and col_province:
                 ws.cell(current, col_province).value = stateprov
@@ -2101,10 +2734,203 @@ def inject_into_webadi(
         out_path = template_path
 
     wb.save(str(out_path))
-    print(f"[OK] WEBADI filled: {out_path}")
+    print(f"[OK] UPDATE WebADI filled: {out_path}")
 
 
 LEGAL_NAME_CLEAN_RE = re.compile(r"[^A-Za-z0-9 ]+")
+
+def inject_into_webadi_attach_sle(
+        template_path: Path,
+        out_path: Optional[Path],
+        df: pd.DataFrame,
+        mode: str = "replace",
+        sheet_name: str = WEBADI_SHEET_DEFAULT,
+        header_start_row: int = 5,
+        debug: bool = False,
+        unprotect: bool = True,
+):
+    """
+    Fills the OC WEBADI ATTACH SLE template.
+
+    Basic info only (no tax, no payment method, no currency)
+    ACTION = "Independent to Independent"
+    GROUP_PARENT_SLE_ACCOUNT_NUMBER = SLE OID
+    """
+    if not template_path.exists():
+        raise FileNotFoundError(f"WEBADI ATTACH SLE template not found: {template_path}")
+
+    wb = load_workbook(
+        str(template_path),
+        keep_vba=True,
+        data_only=False,
+        keep_links=True,
+    )
+
+    if unprotect:
+        if debug:
+            print("[DEBUG] webadi_unprotect=True: unprotecting workbook/sheets.")
+        unprotect_workbook_and_sheets(wb, debug=debug)
+    else:
+        if debug:
+            print("[DEBUG] webadi_unprotect=False: keeping protections.")
+
+    if sheet_name not in wb.sheetnames:
+        raise RuntimeError(f"Sheet '{sheet_name}' not found in template.")
+    ws = wb[sheet_name]
+
+    # Update BATCH_NAME in E3 with today's date
+    try:
+        today_str = datetime.now().strftime("%m/%d/%Y")
+        ws["E3"].value = f"OC WEBADI ATTACH SLE {today_str}"
+        if debug:
+            print(f"[DEBUG] E3 (BATCH_NAME) set to 'OC WEBADI ATTACH SLE {today_str}'")
+    except Exception as e:
+        if debug:
+            print(f"[DEBUG] Failed to update BATCH_NAME in E3: {e}")
+
+    header_row, header_map = find_header_row(
+        ws, start_at_row=header_start_row, debug=debug
+    )
+
+    if debug:
+        print(f"[DEBUG] ATTACH SLE WebADI: Found {len(header_map)} headers in template:")
+        for norm_name, col_idx in sorted(header_map.items()):
+            print(f"  {norm_name} → Column {col_idx}")
+
+    # Mapping for ATTACH SLE template (basic info only, no tax)
+    wanted = {
+        "GROUP_PARENT_SLE_ACCOUNT_NUMBER": "SLE OID",
+        "HOTEL_ID": "Expedia ID",
+        "EFFECTIVE_DATE": "Effective Date of Change",
+        "CUSTOMER_NAME": "Hotel Name",
+        "ADDRESS_LINE_1": "Address Line 1",  # Changed from ADDRESS1 to match OID Creation
+        "CITY": "City",
+        "POSTAL_CODE": "Postal Code",
+        "COUNTRY": "WEBADI_COUNTRY",
+        "FIRST_NAME": "First Name",
+        "LAST_NAME": "Last Name",
+        "EMAIL_ADDRESS": "Email Address",  # Added per user request - from column U of extraction
+        "COMMENTS": "file_name",  # Will be converted to comment format
+    }
+
+    col_state = header_map.get("STATE")
+    col_province = header_map.get("PROVINCE")
+    col_site_purpose = header_map.get("SITE_PURPOSE")
+    col_action = header_map.get("ACTION")
+    col_upl = column_index_from_string("B")
+
+    key_col = header_map.get("HOTEL_ID") or header_map.get("CUSTOMER_NAME")
+    if not key_col:
+        raise RuntimeError(
+            "Could not find key columns (HOTEL_ID/CUSTOMER_NAME) in ATTACH SLE WebADI header."
+        )
+
+    # Clear or clone rows according to mode
+    if mode.lower() == "replace":
+        last = ws.max_row
+        for _ in range(header_row + 1, last + 1):
+            ws.delete_rows(header_row + 1)
+        base_row = header_row
+        if debug:
+            print(
+                f"[DEBUG] Replace mode: cleared rows after header row {header_row}."
+            )
+    else:
+        base_row = last_data_row(ws, header_row, key_col)
+        if debug:
+            print(
+                f"[DEBUG] Append mode: last data row detected = {base_row}."
+            )
+
+    current = base_row
+
+    for _, rec in df.iterrows():
+        iso2 = to_iso2(rec.get("Country"))
+        stateprov = rec.get("State/Province")
+
+        current += 1
+        src_row = base_row if base_row > header_row else header_row + 1
+        clone_row(ws, src_row, current)
+
+        # Set fixed columns for ATTACH SLE template
+        ws.cell(current, col_upl).value = "O"
+        if col_action:
+            ws.cell(current, col_action).value = "Independent to Independent"
+        if col_site_purpose:
+            ws.cell(current, col_site_purpose).value = "BILL_TO"
+
+        # Always clear STATE/PROVINCE in new rows to avoid inheriting junk
+        if col_state:
+            ws.cell(current, col_state).value = None
+        if col_province:
+            ws.cell(current, col_province).value = None
+
+        # IMPORTANT: Clear tax-related columns (J-N) and payment/currency columns (AB, AC)
+        # These should remain BLANK in ATTACH SLE template
+        for col_letter in ["J", "K", "L", "M", "N", "AB", "AC"]:
+            col_idx = column_index_from_string(col_letter)
+            ws.cell(current, col_idx).value = None
+
+        # Fill columns according to mapping (basic info only)
+        for webadi_col, script_col in wanted.items():
+            col_idx = header_map.get(webadi_col)
+            if not col_idx:
+                if debug:
+                    print(f"[DEBUG] ATTACH SLE: Column '{webadi_col}' not found in template header, skipping")
+                continue
+            val = rec.get(script_col)
+            if debug and webadi_col in ["FIRST_NAME", "LAST_NAME", "ADDRESS_LINE_1"]:
+                print(f"[DEBUG] ATTACH SLE: Filling {webadi_col} (col {col_idx}) with value: {val}")
+
+            # COMMENTS: Format as "filename Updated per HCPIF - Attach SLE"
+            # Note: file_name already contains Expedia IDs, so don't duplicate them
+            if webadi_col == "COMMENTS":
+                file_name = rec.get("file_name", "")
+                if not _is_blank(file_name):
+                    comment_text = f"{file_name} Updated per HCPIF - Attach SLE"
+                    ws.cell(current, col_idx).value = comment_text
+                else:
+                    ws.cell(current, col_idx).value = None
+
+            # EFFECTIVE_DATE: Format as '15/Feb/2026' (DD/MMM/YYYY)
+            elif webadi_col == "EFFECTIVE_DATE":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    try:
+                        if isinstance(val, datetime):
+                            formatted_date = val.strftime("%d/%b/%Y")
+                            ws.cell(current, col_idx).value = formatted_date
+                        elif isinstance(val, str):
+                            from dateutil import parser
+                            parsed_date = parser.parse(val)
+                            formatted_date = parsed_date.strftime("%d/%b/%Y")
+                            ws.cell(current, col_idx).value = formatted_date
+                        else:
+                            ws.cell(current, col_idx).value = val
+                    except:
+                        ws.cell(current, col_idx).value = val
+
+            # All other fields
+            elif _is_blank(val):
+                ws.cell(current, col_idx).value = None
+            else:
+                ws.cell(current, col_idx).value = val
+
+        # Fill State/Province
+        if not _is_blank(stateprov) and isinstance(stateprov, str):
+            if iso2 == "CA" and col_province:
+                ws.cell(current, col_province).value = stateprov
+            elif iso2 != "CA" and col_state:
+                ws.cell(current, col_state).value = stateprov
+
+    if not out_path:
+        out_path = template_path
+
+    wb.save(str(out_path))
+    print(f"[OK] ATTACH SLE WebADI filled: {out_path}")
+
+
 
 
 def inject_into_oid_creation_webadi(
@@ -2134,7 +2960,7 @@ def inject_into_oid_creation_webadi(
         raise RuntimeError(f"Sheet '{sheet_name}' not found in OID Creation template.")
     ws = wb[sheet_name]
 
-    # Cabeçalho / batch
+    # Header / batch
     try:
         ws["E3"] = f"SLE OID Creation {datetime.now().strftime('%m%d%Y')}"
     except Exception as e:
@@ -2204,7 +3030,7 @@ def inject_into_oid_creation_webadi(
         src_row = base_row if base_row > header_row else header_row + 1
         clone_row(ws, src_row, current)
 
-        # limpa state/province antes
+        # clear state/province first
         if col_state:
             ws.cell(current, col_state).value = None
         if col_province:
@@ -2284,6 +3110,176 @@ def add_language_abbreviation_column(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def extract_eid_from_filename(filename: Optional[str]) -> Optional[str]:
+    """
+    Extracts the Expedia ID from the filename pattern.
+    Expected pattern: [case number (8-9 digits)][separator][Expedia ID]
+    Ignores anything in parentheses.
+
+    Examples:
+      - "12345678-987654.pdf" -> "987654"
+      - "153967337 23687.pdf" -> "23687"
+      - "12345678_987654 (some notes).pdf" -> "987654"
+      - "12345678 EID 987654.pdf" -> "987654"
+    """
+    if not filename or not isinstance(filename, str):
+        return None
+
+    # Remove file extension
+    base = os.path.splitext(filename)[0]
+
+    # Remove anything in parentheses
+    base = re.sub(r'\([^)]*\)', '', base).strip()
+
+    # Look for pattern: 8-9 digit case number followed by separator and then EID
+    # The separator can be: -, _, space, or text like "EID", "eid", "-EID", etc.
+    # Changed from \d{8} to \d{8,9} to handle 8 or 9 digit case numbers
+    pattern = r'^\d{8,9}[\s\-_]*(?:EID|eid|Case)?[\s\-_]*(\d+)'
+    match = re.search(pattern, base, re.IGNORECASE)
+
+    if match:
+        return match.group(1).strip()
+
+    # Fallback: if no 8-9 digit pattern, look for any number after common separators
+    # This handles cases where the case number might have different length
+    pattern_fallback = r'^\d+[\s\-_]+(\d+)'
+    match_fallback = re.search(pattern_fallback, base)
+
+    if match_fallback:
+        return match_fallback.group(1).strip()
+
+    return None
+
+
+def add_eid_validation_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds columns to validate that the Expedia ID in the filename matches
+    the Expedia ID extracted from the PDF.
+
+    Adds:
+      - "File Name EID": Expedia ID extracted from filename
+      - "EID Match Status": Validation result
+    """
+    if "file_name" not in df.columns or "Expedia ID" not in df.columns:
+        return df
+
+    df = df.copy()
+
+    # Extract EID from filename
+    df["File Name EID"] = df["file_name"].apply(extract_eid_from_filename)
+
+    # Compare and create status
+    def _validate_eid(row):
+        pdf_eid = str(row.get("Expedia ID", "")).strip()
+        file_eid = str(row.get("File Name EID", "")).strip()
+
+        # Handle empty/missing values
+        if not pdf_eid or pdf_eid in ("", "nan", "None", "<NA>"):
+            return "PDF EID Missing"
+
+        if not file_eid or file_eid in ("", "nan", "None", "<NA>"):
+            return "File Name EID Missing"
+
+        # Compare
+        if pdf_eid == file_eid:
+            return "Match"
+        else:
+            return "EID Provided in the PDF doesn't match"
+
+    df["EID Match Status"] = df.apply(_validate_eid, axis=1)
+
+    # FALLBACK LOGIC: Use File Name EID when PDF EID is wrong/missing
+    # Store original PDF EID before overwriting
+    df["Original PDF EID"] = df["Expedia ID"].copy()
+
+    def _apply_fallback(row):
+        """
+        If PDF EID doesn't match filename EID, use filename EID as fallback.
+        This allows processing to continue while keeping the issue flagged for review.
+        """
+        status = row.get("EID Match Status", "")
+        file_eid = str(row.get("File Name EID", "")).strip()
+        pdf_eid = str(row.get("Expedia ID", "")).strip()
+
+        # Use filename EID as fallback in these cases:
+        # 1. PDF EID is missing but filename has one
+        # 2. PDF EID doesn't match filename EID
+        if status == "PDF EID Missing" and file_eid and file_eid not in ("", "nan", "None"):
+            return file_eid
+        elif status == "EID Provided in the PDF doesn't match" and file_eid and file_eid not in ("", "nan", "None"):
+            return file_eid
+        else:
+            # Keep original PDF EID
+            return pdf_eid
+
+    # Apply fallback: overwrite Expedia ID with filename EID when needed
+    df["Expedia ID"] = df.apply(_apply_fallback, axis=1)
+
+    # Insert these columns right after Expedia ID
+    if "Expedia ID" in df.columns:
+        eid_pos = list(df.columns).index("Expedia ID") + 1
+
+        # Remove from current position and insert after Expedia ID
+        original_eid_col = df.pop("Original PDF EID")
+        file_eid_col = df.pop("File Name EID")
+        status_col = df.pop("EID Match Status")
+
+        df.insert(loc=eid_pos, column="Original PDF EID", value=original_eid_col)
+        df.insert(loc=eid_pos + 1, column="File Name EID", value=file_eid_col)
+        df.insert(loc=eid_pos + 2, column="EID Match Status", value=status_col)
+
+    return df
+
+
+def create_eid_mismatch_review_tab(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Creates a review tab for rows where the EID from the PDF doesn't match
+    the EID from the filename.
+
+    IMPORTANT: The script automatically uses the filename EID as fallback,
+    so processing continues, but these rows are flagged for manual review.
+
+    Returns DataFrame with rows that need manual review.
+    """
+    if "EID Match Status" not in df.columns:
+        return pd.DataFrame()
+
+    # Filter rows where EID doesn't match OR is missing from PDF
+    mismatch_df = df[
+        (df["EID Match Status"] == "EID Provided in the PDF doesn't match") |
+        (df["EID Match Status"] == "PDF EID Missing")
+    ].copy()
+
+    if mismatch_df.empty:
+        return pd.DataFrame()
+
+    # Add explanation column with details about what happened
+    def _explain_fallback(row):
+        status = row.get("EID Match Status", "")
+        original = row.get("Original PDF EID", "")
+        file_eid = row.get("File Name EID", "")
+        current = row.get("Expedia ID", "")
+
+        if status == "PDF EID Missing":
+            return (
+                f"PDF had no Expedia ID. Using filename EID ({file_eid}) as fallback. "
+                "Verify this is correct before uploading to Oracle."
+            )
+        elif status == "EID Provided in the PDF doesn't match":
+            return (
+                f"PDF EID ({original}) does NOT match filename EID ({file_eid}). "
+                f"Using filename EID ({current}) as fallback. "
+                "Please verify which EID is correct before uploading to Oracle."
+            )
+        else:
+            return "Unknown status - manual review required"
+
+    mismatch_df["Review Reason"] = mismatch_df.apply(_explain_fallback, axis=1)
+    mismatch_df["Action Taken"] = "Used filename EID as fallback - row will process normally"
+
+    return mismatch_df
+
+
 def sanitize_legal_name_column(df: pd.DataFrame) -> pd.DataFrame:
     if "Legal Name" not in df.columns:
         return df
@@ -2301,12 +3297,12 @@ def sanitize_legal_name_column(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_country_tax_mapping() -> pd.DataFrame:
     """
-    Lê a planilha de mapeamento (COUNTRY, COUNTRY_NAME, Tax Regime Code, Tax)
-    e retorna um DataFrame limpo.
+    Reads the mapping spreadsheet (COUNTRY, COUNTRY_NAME, Tax Regime Code, Tax)
+    and returns a clean DataFrame.
     """
     path = Path(COUNTRY_TAX_MAPPING_FILE)
     if not path.exists():
-        print(f"[WARN] COUNTRY_TAX_MAPPING_FILE não encontrado: {COUNTRY_TAX_MAPPING_FILE}")
+        print(f"[WARN] COUNTRY_TAX_MAPPING_FILE not found: {COUNTRY_TAX_MAPPING_FILE}")
         return pd.DataFrame()
 
     df_map = pd.read_excel(
@@ -2316,7 +3312,7 @@ def load_country_tax_mapping() -> pd.DataFrame:
         dtype=str,
     )
 
-    # Espera colunas:
+    # Expected columns:
     # A: COUNTRY
     # B: COUNTRY_NAME
     # C: Tax Regime Code
@@ -2336,7 +3332,7 @@ def load_country_tax_mapping() -> pd.DataFrame:
 
     needed = {"MAP_COUNTRY", "COUNTRY_NAME", "TAX_REGIME_CODE", "TAX"}
     if not needed.issubset(df_map.columns):
-        print("[WARN] Country/Tax mapping não tem todas as colunas esperadas "
+        print("[WARN] Country/Tax mapping does not have all expected columns "
               "(COUNTRY, COUNTRY_NAME, Tax Regime Code, Tax).")
         return pd.DataFrame()
 
@@ -2349,13 +3345,13 @@ def load_country_tax_mapping() -> pd.DataFrame:
 
 def enrich_df2_with_country_tax(df2: pd.DataFrame) -> pd.DataFrame:
     """
-    Faz o 'VLOOKUP':
+    Performs the 'VLOOKUP':
       df2['Country']  --> mapping['COUNTRY_NAME']
 
-    Adiciona colunas:
-      - WEBADI_COUNTRY         (vai para coluna COUNTRY do WEBADI)
-      - WEBADI_TAX_REGIME_CODE (vai para TAX_REGIME_CODE do WEBADI)
-      - WEBADI_TAX             (vai para TAX do WEBADI)
+    Adds columns:
+      - WEBADI_COUNTRY         (goes to COUNTRY column in WEBADI)
+      - WEBADI_TAX_REGIME_CODE (goes to TAX_REGIME_CODE in WEBADI)
+      - WEBADI_TAX             (goes to TAX in WEBADI)
     """
     df_map = load_country_tax_mapping()
     if df_map.empty or "Country" not in df2.columns:
@@ -2442,7 +3438,7 @@ def main():
 
     args = ap.parse_args()
 
-    # ===== NOVO: pasta local por data (mm.dd.yyyy) =====
+    # ===== NEW: local folder by date (mm.dd.yyyy) =====
     today_str = datetime.now().strftime("%m.%d.%Y")
 
     base_local_dir = Path(args.input_dir or DEFAULT_INPUT_DIR)
@@ -2455,8 +3451,41 @@ def main():
 
     print(f"[INFO] Local run folder: {run_dir}")
 
-    # ===== NOVO: baixar PDFs do SharePoint (PDFs Ready to Load) =====
-    print("[INFO] Downloading PDFs from SharePoint input folder...")
+    # ===== Check for required templates BEFORE processing =====
+    print("\n[INFO] Checking for required templates...")
+    missing_templates = []
+
+    update_template = Path(DEFAULT_WEBADI_UPDATE_TEMPLATE)
+    if not update_template.exists():
+        missing_templates.append(f"  - OC WEBADI UPDATE template: {update_template}")
+
+    attach_sle_template = Path(DEFAULT_WEBADI_ATTACH_SLE_TEMPLATE)
+    if not attach_sle_template.exists():
+        missing_templates.append(f"  - OC WEBADI ATTACH SLE template: {attach_sle_template}")
+
+    oid_template = Path(DEFAULT_OID_CREATION_TEMPLATE)
+    if not oid_template.exists():
+        missing_templates.append(f"  - OID Creation template: {oid_template}")
+
+    tax_mapping = Path(COUNTRY_TAX_MAPPING_FILE)
+    if not tax_mapping.exists():
+        missing_templates.append(f"  - Tax mapping file: {tax_mapping}")
+
+    if missing_templates:
+        print("[WARN] The following required files are missing:")
+        for item in missing_templates:
+            print(item)
+        print("\n[WARN] WebADI files will NOT be generated without templates.")
+        print(f"[WARN] Please ensure all templates exist in: {base_local_dir}")
+        user_input = input("\nContinue anyway? (y/n): ")
+        if user_input.lower() != 'y':
+            print("[INFO] Aborting script. Please restore templates and try again.")
+            sys.exit(0)
+    else:
+        print("[OK] All templates found!")
+
+    # ===== NEW: download PDFs from SharePoint (PDFs Ready to Load) =====
+    print("\n[INFO] Downloading PDFs from SharePoint input folder...")
     downloaded = sp_download_pdfs_from_folder(SP_INPUT_FOLDER, input_dir)
     print(f"[INFO] {len(downloaded)} PDF(s) downloaded to {input_dir}")
 
@@ -2507,15 +3536,34 @@ def main():
 
     df = add_country_iso2_column(df)
     df = add_language_abbreviation_column(df)
+    df = add_eid_validation_columns(df)  # Validate EID from filename vs PDF
+
+    # Create EID mismatch review tab BEFORE enrichment
+    df_eid_mismatch = create_eid_mismatch_review_tab(df)
+
     df = add_sle_oid_from_legal_name(df)
 
     base_columns = list(df.columns)
 
-    df, df_excluded, df_oracle_details = enrich_hcpif_with_oracle(df, base_columns)
+    df, df_excluded, df_oracle_details, df_no_oid_ec, df_sle_review = enrich_hcpif_with_oracle(df, base_columns)
 
     df = sanitize_legal_name_column(df)
     if not df_excluded.empty:
         df_excluded = sanitize_legal_name_column(df_excluded)
+
+    # ── NEW: SF Report "Rebill Request" check ──────────────────────────
+    df, df_rebill = check_sf_report_rebill(df, run_dir)
+    # df_excluded also needs to have rebill rows removed
+    if not df_excluded.empty and not df_rebill.empty:
+        rebill_eids = set(
+            df_rebill["Expedia ID"].astype(str).str.strip()
+            if "Expedia ID" in df_rebill.columns else []
+        )
+        df_excluded = df_excluded[
+            ~df_excluded["Expedia ID"].astype(str).str.strip().isin(rebill_eids)
+        ].copy()
+    # ── END NEW ─────────────────────────────────────────────────────────────
+
     oid_creation_template_path = None
     default_oid_tpl = Path(DEFAULT_OID_CREATION_TEMPLATE)
     if default_oid_tpl.exists():
@@ -2557,6 +3605,37 @@ def main():
                 df_oracle_details.to_excel(
                     writer, sheet_name="Oracle_Details", index=False
                 )
+            # ── NEW: write rebill tab ───────────────────────────────────────
+            if not df_rebill.empty:
+                df_rebill.to_excel(
+                    writer, sheet_name="Review - Existing Rebill", index=False
+                )
+                print(f"[INFO] {len(df_rebill)} row(s) written to 'Review - Existing Rebill' tab.")
+            # ── END NEW ────────────────────────────────────────────────────
+
+            # ── NEW: write NO OID - EC tab ──────────────────────────────────
+            if not df_no_oid_ec.empty:
+                df_no_oid_ec.to_excel(
+                    writer, sheet_name="NO OID - EC", index=False
+                )
+                print(f"[INFO] {len(df_no_oid_ec)} row(s) written to 'NO OID - EC' tab.")
+            # ── END NEW ────────────────────────────────────────────────────
+
+            # ── NEW: write Review - SLE Match tab ──────────────────────────
+            if not df_sle_review.empty:
+                df_sle_review.to_excel(
+                    writer, sheet_name="Review - SLE Match", index=False
+                )
+                print(f"[INFO] {len(df_sle_review)} row(s) written to 'Review - SLE Match' tab.")
+            # ── END NEW ─────────────────────────────────────────────────────
+
+            # ── NEW: write Review - EID Mismatch tab ────────────────────────
+            if not df_eid_mismatch.empty:
+                df_eid_mismatch.to_excel(
+                    writer, sheet_name="Review - EID Mismatch", index=False
+                )
+                print(f"[INFO] {len(df_eid_mismatch)} row(s) written to 'Review - EID Mismatch' tab.")
+            # ── END NEW ─────────────────────────────────────────────────────
 
         print("\n[OK] Done!")
         print(f"- PDFs read from: {input_dir}")
@@ -2569,89 +3648,82 @@ def main():
         print("  2) You lack permission.")
         raise
 
-    template_path = None
-    if args.webadi_template:
-        template_path = Path(args.webadi_template)
-    else:
-        default_tpl = Path(DEFAULT_WEBADI_TEMPLATE)
-        if default_tpl.exists():
-            template_path = default_tpl
+    # ===== WEBADI GENERATION: 3 FILES =====
+    # Prepare data for WebADI files
+    need_cols = {
+        "Expedia ID", "SLE OID", "Legal Name", "Hotel Name",
+        "Address Line 1", "City", "State/Province", "Postal Code", "Country",
+        "Currency", "Tax Registration Number", "Tax Registration Status",
+        "Effective Date of Change", "Current RM", "file_name",
+        "First Name", "Last Name", "Email Address", "Preferred Language",
+    }
 
-    out_path = None
+    present = [c for c in need_cols if c in df.columns]
+    # Always include file_name if it exists
+    if "file_name" in df.columns and "file_name" not in present:
+        present.append("file_name")
+    if present:
+        df_webadi = df.loc[
+            (df["Expedia ID"].notna()) | (df["Legal Name"].notna()),
+            present,
+        ].copy()
 
-    if template_path:
-        if args.webadi_output:
-            out_path = Path(args.webadi_output)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-        else:
+        if len(df_webadi) > 0:
+            # Apply VLOOKUP Country/Tax enrichment
+            df_webadi = enrich_df2_with_country_tax(df_webadi)
             today_str_for_webadi = datetime.now().strftime("%m%d%Y")
-            out_name = f"OC WEBADI {today_str_for_webadi}.xlsm"
-            out_path = template_path.parent / out_name
 
-        print(f"[INFO] WEBADI template: {template_path}")
-        print(f"[INFO] WEBADI output: {out_path}")
-        print(
-            f"[INFO] WEBADI sheet: {args.webadi_sheet} | header_start_row={args.webadi_header_start_row}"
-        )
-
-        need_cols = {
-            "Expedia ID",
-            "Legal Name",
-            "Address Line 1",
-            "City",
-            "State/Province",
-            "Postal Code",
-            "Country",
-            "Currency",
-            "First Name",
-            "Last Name",
-            "Email Address",
-            "Preferred Language",
-            "Tax Registration Number",
-            "Tax Registration Status",
-            "Hotel Name",
-            "Effective Date of Change",
-            "Current RM",
-            "Comments",
-        }
-
-        present = [c for c in need_cols if c in df.columns]
-        if not present:
-            print("[WARN] No required columns for WEBADI are available.")
-        else:
-            df2 = df.loc[
-                (df["Expedia ID"].notna()) | (df["Legal Name"].notna()),
-                present,
-            ]
-            if not len(df2):
-                print("[WARN] Nothing to insert into WEBADI (no Expedia ID / Legal Name).")
-            else:
-                print(f"[INFO] WEBADI mode: {args.webadi_mode}")
-
-                # ===== NOVO: aplicar VLOOKUP Country/Tax =====
-                df2 = enrich_df2_with_country_tax(df2)
-
+            # FILE 1: OC WEBADI UPDATE
+            update_template = Path(DEFAULT_WEBADI_UPDATE_TEMPLATE)
+            if update_template.exists():
+                update_out_path = update_template.parent / f"OC WEBADI UPDATE {today_str_for_webadi}.xlsm"
+                print(f"\n[INFO] Generating UPDATE WebADI...")
+                print(f"  Template: {update_template}")
+                print(f"  Output: {update_out_path}")
+                print(f"  Rows: {len(df_webadi)}")
                 try:
-                    inject_into_webadi(
-                        template_path,
-                        out_path,
-                        df2,
-                        mode=args.webadi_mode,
-                        sheet_name=args.webadi_sheet,
-                        header_start_row=args.webadi_header_start_row,
+                    inject_into_webadi_update(
+                        update_template,
+                        update_out_path,
+                        df_webadi,
+                        mode="replace",
+                        sheet_name="WebADI",
+                        header_start_row=5,
                         debug=args.webadi_debug,
                         unprotect=args.webadi_unprotect,
                     )
                 except Exception as ex:
-                    print(f"[ERROR] Failed to fill WEBADI: {ex}")
-                    print(
-                        "Suggestions: check sheet name, unprotect workbook (if needed), "
-                        "and validate the header row."
+                    print(f"[ERROR] Failed to fill UPDATE WebADI: {ex}")
+            else:
+                print(f"[WARN] UPDATE template not found: {update_template}")
+
+            # FILE 2: OC WEBADI ATTACH SLE
+            attach_sle_template = Path(DEFAULT_WEBADI_ATTACH_SLE_TEMPLATE)
+            if attach_sle_template.exists():
+                attach_sle_out_path = attach_sle_template.parent / f"OC WEBADI Attach SLE {today_str_for_webadi}.xlsm"
+                print(f"\n[INFO] Generating ATTACH SLE WebADI...")
+                print(f"  Template: {attach_sle_template}")
+                print(f"  Output: {attach_sle_out_path}")
+                print(f"  Rows: {len(df_webadi)}")
+                try:
+                    inject_into_webadi_attach_sle(
+                        attach_sle_template,
+                        attach_sle_out_path,
+                        df_webadi,
+                        mode="replace",
+                        sheet_name="WebADI",
+                        header_start_row=5,
+                        debug=args.webadi_debug,
+                        unprotect=args.webadi_unprotect,
                     )
+                except Exception as ex:
+                    print(f"[ERROR] Failed to fill ATTACH SLE WebADI: {ex}")
+            else:
+                print(f"[WARN] ATTACH SLE template not found: {attach_sle_template}")
+        else:
+            print("[INFO] No rows available for WebADI generation.")
     else:
-        print(
-            "[INFO] WEBADI step not executed (no --webadi_template and no default template found)."
-        )
+        print("[WARN] Required columns for WebADI not found in extraction.")
 
     if oid_creation_template_path:
         if not df_oid_creation.empty:
@@ -2680,27 +3752,34 @@ def main():
     else:
         print("[INFO] OID Creation template not found. Skipping additional WEBADI.")
 
-    # ===== NOVO: Upload de resultados para SharePoint =====
+    # ===== NEW: Upload results to SharePoint =====
     try:
         sp_output_folder = f"{SP_OUTPUT_BASE}/{today_str}"
 
         print(f"[INFO] Uploading HCPIF_extraction.xlsx to SharePoint: {sp_output_folder}")
         sp_upload_file(output_path, sp_output_folder)
 
-        if out_path is not None:
-            print(f"[INFO] Uploading WEBADI to SharePoint: {sp_output_folder}")
-            sp_upload_file(out_path, sp_output_folder)
+        # Upload UPDATE WebADI
+        if 'update_out_path' in locals() and update_out_path is not None and update_out_path.exists():
+            print(f"[INFO] Uploading UPDATE WebADI to SharePoint: {sp_output_folder}")
+            sp_upload_file(update_out_path, sp_output_folder)
 
-        if oid_creation_out_path is not None:
+        # Upload ATTACH SLE WebADI
+        if 'attach_sle_out_path' in locals() and attach_sle_out_path is not None and attach_sle_out_path.exists():
+            print(f"[INFO] Uploading ATTACH SLE WebADI to SharePoint: {sp_output_folder}")
+            sp_upload_file(attach_sle_out_path, sp_output_folder)
+
+        # Upload OID Creation WebADI
+        if 'oid_creation_out_path' in locals() and oid_creation_out_path is not None and oid_creation_out_path.exists():
             print(f"[INFO] Uploading OID Creation WEBADI to SharePoint: {sp_output_folder}")
             sp_upload_file(oid_creation_out_path, sp_output_folder)
 
-        # Arquivar PDFs de entrada
+        # Archive input PDFs
         for pdf in pdf_files:
             print(f"[INFO] Archiving PDF to SharePoint: {SP_ARCHIVE_FOLDER} -> {pdf.name}")
             sp_upload_file(pdf, SP_ARCHIVE_FOLDER)
 
-        print("[INFO] SharePoint upload completed (HCPIF, WEBADI, PDFs arquivados).")
+        print("[INFO] SharePoint upload completed (HCPIF, 3 WebADIs, PDFs archived).")
     except Exception as e:
         print(f"[WARN] Failed to upload results to SharePoint: {e}")
 
