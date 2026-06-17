@@ -1,0 +1,869 @@
+import datetime as dt
+from pathlib import Path
+from typing import List
+
+import oracledb
+import pandas as pd
+from openpyxl import Workbook, load_workbook
+from openpyxl.formula.translate import Translator
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+
+WORK_DIR = Path(r"C:\Users\josenjr\Downloads\180+ CM Script Creation")
+CONCAT_PATH = WORK_DIR / "Concat.xlsx"
+M4APPS_TEMPLATE = WORK_DIR / "Apply CM M4apps.xlsm"
+
+# -------------------- ORACLE CONFIG --------------------
+ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
+ORACLE_USERNAME = "josenjr"
+ORACLE_PASSWORD = "xxxxxxxx"  # troque aqui se quiser
+ORACLE_DSN = "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI"
+
+USERNAME = ORACLE_USERNAME
+PASSWORD = ORACLE_PASSWORD
+DSN = ORACLE_DSN
+
+PRIMARY_QUERY_180_CM_GROUP = r"""
+SELECT
+    HCA.ACCOUNT_NUMBER                         AS "Account Number",
+    GLL.LEDGER_NAME                            AS "Ledger",
+    HOU.NAME                                   AS "Operating Unit",
+    HCA.ATTRIBUTE1                             AS "Hotel Id",
+    HZP.PARTY_NAME                             AS "Customer Name",
+    HZP.COUNTRY                                AS "Country",
+    HZP.CITY                                   AS "City",
+    CASE
+        WHEN UPPER(TRIM(HZP.COUNTRY)) IN ('AS','AU','BD','BN','BT','CC','CK','CN','FJ','FM','GU','HK','ID','IN','JP','KH','KP','KR','LA','LK','MH','MM','MN','MO','MP','MV','MY','NC','NF','NP','NU','NZ','PF','PG','PH','PK','PW','SB','SG','TH','TK','TL','TO','TW','VN','VU','WF','WS','NR','TF','TP','TV','CX','HM','IO','KI')
+            THEN 'APAC'
+        WHEN UPPER(TRIM(HZP.COUNTRY)) IN ('AG','AI','AN','AR','AW','BB','BL','BM','BO','BQ','BR','BS','BZ','CL','CO','CR','CU','CW','DM','DO','EC','FK','GD','GF','GP','GT','GY','HN','HT','JM','KN','KY','LC','MF','MQ','MS','MX','NI','PA','PE','PN','PR','PY','SR','SV','SX','TC','TT','UY','VC','VE','VG','VI','GS')
+            THEN 'LATAM'
+        WHEN UPPER(TRIM(HZP.COUNTRY)) IN ('AL','AM','AT','AZ','BA','BE','BG','BY','CH','CZ','DE','DK','EE','FI','FO','FR','GB','GE','GG','GL','HR','HU','IE','IS','JE','KG','KZ','LI','LT','LU','LV','MD','ME','MK','NL','NO','PL','PM','RO','RS','RU','SE','SH','SI','SJ','SK','TJ','TM','UA','UZ','CS','FX','LX','AQ','ZZ','YU','AX','EH','IM','AD','AE','AF','AO','BF','BH','BI','BJ','BV','BW','CD','CF','CG','CI','CM','CV','CY','DJ','DZ','EG','ER','ES','ET','GA','GH','GI','GM','GN','GQ','GR','GW','IL','IQ','IR','IT','JO','KE','KM','KW','LB','LR','LS','LY','MA','MC','MG','ML','MR','MT','MU','MW','MZ','NA','NE','NG','OM','PS','PT','QA','RE','RW','SA','SC','SD','SL','SM','SN','SS','ST','SY','SZ','TD','TG','TN','TR','TZ','UG','VA','YE','YT','ZA','ZM','ZW','SO','ZR')
+            THEN 'EMEA'
+        WHEN UPPER(TRIM(HZP.COUNTRY)) IN ('CA','US','UM')
+            THEN 'NAMER'
+        ELSE 'NOT_DEFINED'
+    END                                         AS "PPO Super Region",
+    CTTA.NAME                                   AS "TRX Type Name",
+    CASE
+        WHEN UPPER(PSA.CLASS) = 'CM' THEN 'Credit Memo'
+        WHEN UPPER(PSA.CLASS) = 'DM' THEN 'Debit Memo'
+        WHEN UPPER(PSA.CLASS) IN ('INV','INVOICE') THEN 'Invoice'
+        ELSE PSA.CLASS
+    END                                         AS "Class",
+    CTA.TRX_NUMBER                              AS "Transaction Number",
+    CTA.TRX_DATE                                AS "TRX DATE",
+    PSA.GL_DATE                                 AS "GL Date",
+    TT.NAME                                     AS "Term Name",
+    CTA.INTERFACE_HEADER_ATTRIBUTE1             AS "Reference",
+    CTA.REASON_CODE                             AS "CM Reason",
+    ARM.NAME                                    AS "Receipt Method",
+    CTA.COMMENTS                                AS "Comments",
+    PSA.INVOICE_CURRENCY_CODE                   AS "Currency",
+    PSA.AMOUNT_DUE_ORIGINAL                     AS "Entered Amt",
+    PSA.AMOUNT_DUE_REMAINING                    AS "Open Balance",
+    CASE
+        WHEN PSA.AMOUNT_DUE_ORIGINAL <> PSA.AMOUNT_DUE_REMAINING THEN 'Yes'
+        ELSE 'No'
+    END                                         AS "Application",
+    PSA.AMOUNT_APPLIED                          AS "Receipt Applied",
+    PSA.AMOUNT_ADJUSTED                         AS "Adjusment Applied",
+    PSA.AMOUNT_CREDITED                         AS "Credit Applied",
+    '180+ Days'                                 AS "AGING_BUCKET"
+FROM APPS.RA_CUSTOMER_TRX_ALL CTA
+LEFT JOIN AR.HZ_CUST_ACCOUNTS HCA ON CTA.BILL_TO_CUSTOMER_ID = HCA.CUST_ACCOUNT_ID
+LEFT JOIN AR.HZ_PARTIES HZP ON HCA.PARTY_ID = HZP.PARTY_ID
+LEFT JOIN APPS.HR_OPERATING_UNITS HOU ON HOU.ORGANIZATION_ID = CTA.ORG_ID
+LEFT JOIN APPS.GL_LEDGER_LE_V GLL ON GLL.LEGAL_ENTITY_ID = HOU.DEFAULT_LEGAL_CONTEXT_ID
+LEFT JOIN APPS.AR_PAYMENT_SCHEDULES_ALL PSA ON PSA.CUSTOMER_TRX_ID = CTA.CUSTOMER_TRX_ID
+LEFT JOIN AR.AR_RECEIPT_METHODS ARM ON CTA.RECEIPT_METHOD_ID = ARM.RECEIPT_METHOD_ID
+LEFT JOIN APPS.RA_CUST_TRX_TYPES_ALL CTTA ON CTTA.CUST_TRX_TYPE_ID = CTA.CUST_TRX_TYPE_ID
+LEFT JOIN APPS.AR_CUSTOMER_PROFILES_V CPV ON HCA.CUST_ACCOUNT_ID = CPV.CUSTOMER_ID
+LEFT JOIN AR.RA_TERMS_TL TT ON CTA.TERM_ID = TT.TERM_ID AND TT.LANGUAGE = 'US'
+LEFT JOIN (
+    SELECT HR.OBJECT_ID,
+           HR.SUBJECT_ID,
+           HR.RELATIONSHIP_CODE,
+           HR.START_DATE
+    FROM AR.HZ_RELATIONSHIPS HR
+    WHERE HR.END_DATE = DATE '2012-12-31'
+      AND HR.RELATIONSHIP_CODE IN ('LEGAL ENTITY/OWNER OF','GROUP OF')
+) REL ON REL.OBJECT_ID = HCA.PARTY_ID
+WHERE
+    GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
+    AND PSA.AMOUNT_DUE_REMAINING <> 0
+    AND CTA.TRX_DATE >= DATE '2020-01-01'
+    AND CTA.TRX_DATE < TRUNC(SYSDATE) + 1
+    AND TRUNC(PSA.DUE_DATE) < TRUNC(SYSDATE) - 180
+    AND PSA.CLASS IN ('CM','DM','INV')
+    AND HOU.NAME IN (
+        '14101 Travelscape, LLC',
+        '11105 Expedia, Inc.',
+        '12305 Expedia Lodging Partner Services Sarl',
+        '23310 Venere Net S.r.l.',
+        '11115 Expedia do Brasil Agencia'
+    )
+    AND CTTA.NAME IN (
+        'CH_DIR_GROUP_DM_USD',
+        'CH_DIR_GROUP_CM_USD',
+        'US_DIR_GROUP_CM_USD',
+        'US_DIR_GROUP_DM_USD',
+        'TS_DIR_GROUP_CM_USD',
+        'TS_DIR_GROUP_DM_USD',
+        'TS_DIR_GROUP_INVOICE',
+        'US_DIR_GROUP_INVOICE',
+        'CH_DIR_GROUP_INVOICE'
+    )
+ORDER BY
+    TT.NAME,
+    PSA.GL_DATE,
+    HZP.CITY,
+    CTA.TRX_NUMBER
+"""
+
+WO_PER_OID_QUERY = r"""
+SELECT
+    CTA.TRX_NUMBER              AS "Transaction Number",
+    CTTA.NAME                   AS "Transaction Type",
+    CTA.TRX_DATE                AS "Transaction Date",
+    HCA.ACCOUNT_NUMBER          AS "Account Number",
+    HOU.NAME                    AS "Operating Unit",
+    CTA.INVOICE_CURRENCY_CODE   AS "Entered Currency",
+    AAA.AMOUNT                  AS "Entered Amount",
+    AAA.ADJUSTMENT_NUMBER       AS "Adjustment Number",
+    AAA.REASON_CODE             AS "Reason Code"
+FROM AR.AR_ADJUSTMENTS_ALL      AAA
+JOIN AR.RA_CUSTOMER_TRX_ALL     CTA  ON CTA.CUSTOMER_TRX_ID   = AAA.CUSTOMER_TRX_ID
+JOIN AR.RA_CUST_TRX_TYPES_ALL   CTTA ON CTTA.CUST_TRX_TYPE_ID = CTA.CUST_TRX_TYPE_ID
+JOIN AR.HZ_CUST_ACCOUNTS        HCA  ON HCA.CUST_ACCOUNT_ID   = CTA.BILL_TO_CUSTOMER_ID
+JOIN APPS.HR_OPERATING_UNITS    HOU  ON HOU.ORGANIZATION_ID   = CTA.ORG_ID
+JOIN APPS.GL_LEDGER_LE_V        GLL  ON GLL.LEGAL_ENTITY_ID   = HOU.DEFAULT_LEGAL_CONTEXT_ID
+WHERE
+    GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
+    AND CTTA.NAME NOT LIKE '%EAC%'
+    AND (
+           INSTR(HOU.NAME, '11105') > 0
+        OR INSTR(HOU.NAME, '11115') > 0
+        OR INSTR(HOU.NAME, '12305') > 0
+        OR INSTR(HOU.NAME, '14101') > 0
+        OR INSTR(HOU.NAME, '23310') > 0
+        OR INSTR(HOU.NAME, '72110') > 0
+    )
+    AND HCA.ACCOUNT_NUMBER IN ({placeholders})
+ORDER BY
+    HCA.ACCOUNT_NUMBER,
+    CTA.TRX_NUMBER,
+    AAA.ADJUSTMENT_NUMBER
+"""
+
+# Query to get latest USD exchange rates from Oracle GL_DAILY_RATES
+CURRENCY_CONVERSION_QUERY = r"""
+SELECT DISTINCT
+    GDR.FROM_CURRENCY,
+    GDR.TO_CURRENCY,
+    GDR.CONVERSION_RATE,
+    GDR.CONVERSION_DATE
+FROM APPS.GL_DAILY_RATES GDR
+WHERE GDR.TO_CURRENCY = 'USD'
+  AND GDR.CONVERSION_TYPE = 'Corporate'
+  AND GDR.CONVERSION_DATE = (
+      SELECT MAX(GDR2.CONVERSION_DATE)
+      FROM APPS.GL_DAILY_RATES GDR2
+      WHERE GDR2.FROM_CURRENCY = GDR.FROM_CURRENCY
+        AND GDR2.TO_CURRENCY = 'USD'
+        AND GDR2.CONVERSION_TYPE = 'Corporate'
+        AND GDR2.CONVERSION_DATE <= TRUNC(SYSDATE)
+  )
+ORDER BY GDR.FROM_CURRENCY
+"""
+
+def init_oracle():
+    try:
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
+    except Exception:
+        pass
+
+def run_query(conn, sql: str, params=None) -> pd.DataFrame:
+    with conn.cursor() as cur:
+        cur.execute(sql, params or {})
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    return pd.DataFrame(rows, columns=cols)
+
+def normalize_class(v) -> str:
+    s = str(v).strip().upper()
+    if s in {"CM", "CREDIT MEMO"}:
+        return "Credit Memo"
+    if s in {"DM", "DEBIT MEMO"}:
+        return "Debit Memo"
+    if s in {"INV", "INVOICE"}:
+        return "Invoice"
+    return str(v).strip()
+
+def is_group(v) -> bool:
+    return "GROUP" in str(v).upper()
+
+def to_num(v) -> float:
+    try:
+        if pd.isna(v):
+            return 0.0
+        return round(float(v), 2)
+    except Exception:
+        return 0.0
+
+def make_run_dir(base_dir: Path) -> Path:
+    today_folder = dt.date.today().strftime("%Y%m%d")
+    run_dir = base_dir / today_folder
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+def output_workbook_path(run_dir: Path) -> Path:
+    return run_dir / "180+ CMs Workbook.xlsx"
+
+def update_concat_for_unmatched(accounts: List[str]) -> None:
+    if not CONCAT_PATH.exists():
+        return
+
+    wb = load_workbook(CONCAT_PATH)
+    ws = wb.active
+    template_formula = ws["B2"].value
+    max_clear = max(ws.max_row, len(accounts) + 10)
+
+    for r in range(2, max_clear + 1):
+        ws[f"A{r}"] = None
+        if r > 2:
+            ws[f"B{r}"] = None
+
+    for i, acc in enumerate(accounts, start=2):
+        ws[f"A{i}"] = str(acc)
+
+    if isinstance(template_formula, str) and template_formula.startswith("="):
+        ws["B2"] = template_formula
+        last_row = len(accounts) + 1
+        for r in range(3, last_row + 1):
+            ws[f"B{r}"] = Translator(template_formula, origin="B2").translate_formula(f"B{r}")
+
+    wb.save(CONCAT_PATH)
+
+def build_cm_apply_details(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
+    data["Class"] = data["Class"].apply(normalize_class)
+    data["Account Number"] = data["Account Number"].astype(str).str.strip()
+    data["Ledger"] = data["Ledger"].astype(str).str.strip()
+    data["Operating Unit"] = data["Operating Unit"].astype(str).str.strip()
+    data["Currency"] = data["Currency"].astype(str).str.strip()
+    data["TRX DATE"] = pd.to_datetime(data["TRX DATE"], errors="coerce")
+    data["GL Date"] = pd.to_datetime(data["GL Date"], errors="coerce")
+    data["Open Balance"] = pd.to_numeric(data["Open Balance"], errors="coerce").fillna(0.0)
+    data["_group_flag"] = data["TRX Type Name"].apply(is_group)
+
+    rows = []
+    # NOW GROUPING BY OPERATING UNIT TOO - ensures CM and target are in same OU
+    for _, grp in data.groupby(["Account Number", "Ledger", "Operating Unit", "Currency"], dropna=False):
+        cms = grp[grp["Class"] == "Credit Memo"].copy()
+        targets = grp[grp["Class"].isin(["Invoice", "Debit Memo"])].copy()
+        if cms.empty or targets.empty:
+            continue
+
+        cms = cms.sort_values(["TRX DATE", "GL Date", "Transaction Number"], kind="stable")
+        targets = targets.sort_values(["TRX DATE", "GL Date", "Transaction Number"], kind="stable").copy()
+        targets["remaining_to_apply"] = targets["Open Balance"].abs().round(2)
+
+        for _, cm in cms.iterrows():
+            cm_remaining = round(abs(to_num(cm["Open Balance"])), 2)
+            if cm_remaining <= 0:
+                continue
+
+            eligible_mask = targets["remaining_to_apply"] > 0
+            if cm["_group_flag"]:
+                eligible_mask &= targets["_group_flag"]
+            eligible = targets[eligible_mask]
+
+            for t_idx, tgt in eligible.iterrows():
+                if cm_remaining <= 0:
+                    break
+
+                tgt_remaining = round(to_num(targets.at[t_idx, "remaining_to_apply"]), 2)
+                if tgt_remaining <= 0:
+                    continue
+
+                applied = round(min(cm_remaining, tgt_remaining), 2)
+                if applied <= 0:
+                    continue
+
+                rows.append({
+                    "Account Number": cm["Account Number"],
+                    "Ledger": cm["Ledger"],
+                    "Operating Unit": cm["Operating Unit"],
+                    "Currency": cm["Currency"],
+                    "Credit Memo Number": cm["Transaction Number"],
+                    "Credit Memo Class": cm["Class"],
+                    "Credit Memo TRX Type": cm["TRX Type Name"],
+                    "Credit Memo Date": cm["TRX DATE"],
+                    "Credit Memo Open Balance": round(to_num(cm["Open Balance"]), 2),
+                    "Applied To Number": tgt["Transaction Number"],
+                    "Applied To Class": tgt["Class"],
+                    "Applied To TRX Type": tgt["TRX Type Name"],
+                    "Applied To Date": tgt["TRX DATE"],
+                    "Applied To Open Balance": round(to_num(tgt["Open Balance"]), 2),
+                    "Applied Amount": applied,
+                })
+
+                cm_remaining = round(cm_remaining - applied, 2)
+                targets.at[t_idx, "remaining_to_apply"] = round(tgt_remaining - applied, 2)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=[
+            "Account Number", "Ledger", "Operating Unit", "Currency", "Credit Memo Number", "Credit Memo Class",
+            "Credit Memo TRX Type", "Credit Memo Date", "Credit Memo Open Balance",
+            "Applied To Number", "Applied To Class", "Applied To TRX Type", "Applied To Date",
+            "Applied To Open Balance", "Applied Amount"
+        ])
+
+    return out.sort_values(
+        ["Account Number", "Ledger", "Operating Unit", "Currency", "Credit Memo Number", "Applied To Date", "Applied To Number"],
+        kind="stable"
+    ).reset_index(drop=True)
+
+def get_currency_rates(conn) -> dict:
+    """
+    Fetch latest USD conversion rates from Oracle GL_DAILY_RATES.
+    Returns dict: {currency_code: rate_to_usd}
+    """
+    try:
+        df_rates = run_query(conn, CURRENCY_CONVERSION_QUERY)
+        if df_rates.empty:
+            print("[WARN] No currency rates found in GL_DAILY_RATES. Using 1.0 for all conversions.")
+            return {}
+
+        # Build dictionary: FROM_CURRENCY -> CONVERSION_RATE
+        rates = {}
+        for _, row in df_rates.iterrows():
+            from_curr = str(row["FROM_CURRENCY"]).strip().upper()
+            rate = float(row["CONVERSION_RATE"]) if pd.notna(row["CONVERSION_RATE"]) else 1.0
+            rates[from_curr] = rate
+
+        # USD to USD is always 1.0
+        rates["USD"] = 1.0
+
+        print(f"[INFO] Loaded {len(rates)} currency conversion rates from Oracle GL_DAILY_RATES")
+        return rates
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch currency rates: {e}")
+        return {}
+
+def convert_to_usd(amount: float, currency: str, rates: dict) -> float:
+    """
+    Convert amount to USD using provided rates dictionary.
+    If currency not found, returns original amount (assumes 1.0 rate).
+    """
+    if pd.isna(amount):
+        return 0.0
+
+    curr_upper = str(currency).strip().upper()
+    if curr_upper == "USD":
+        return round(float(amount), 2)
+
+    rate = rates.get(curr_upper, 1.0)
+    return round(float(amount) * rate, 2)
+
+def build_wo_summary_by_ou(df_wo_matches: pd.DataFrame, rates: dict) -> pd.DataFrame:
+    """
+    Creates summary showing WO reversals per Operating Unit:
+    - Operating Unit
+    - Transaction Count
+    - Total Amount (Original Currency)
+    - Total Amount USD
+    """
+    if df_wo_matches is None or df_wo_matches.empty:
+        return pd.DataFrame(columns=[
+            "Operating Unit", "Transaction Count", "Currency Summary", "Total Amount USD"
+        ])
+
+    df = df_wo_matches.copy()
+    df["Operating Unit"] = df["Operating Unit"].astype(str).str.strip()
+    df["Currency"] = df["Currency"].astype(str).str.strip()
+    df["Applied Amount"] = pd.to_numeric(df["Applied Amount"], errors="coerce").fillna(0.0)
+
+    # Convert all amounts to USD
+    df["Applied Amount USD"] = df.apply(
+        lambda row: convert_to_usd(row["Applied Amount"], row["Currency"], rates),
+        axis=1
+    )
+
+    summary_rows = []
+
+    for ou, ou_group in df.groupby("Operating Unit", dropna=False):
+        # Count unique transactions
+        trx_count = ou_group["WO Transaction Number"].nunique()
+
+        # Build currency summary string (e.g., "EUR: 1,234.56 | GBP: 890.12")
+        currency_totals = ou_group.groupby("Currency")["Applied Amount"].sum().round(2)
+        currency_summary = " | ".join([f"{curr}: {amt:,.2f}" for curr, amt in currency_totals.items()])
+
+        # Total USD
+        total_usd = ou_group["Applied Amount USD"].sum()
+
+        summary_rows.append({
+            "Operating Unit": ou,
+            "Transaction Count": trx_count,
+            "Currency Summary": currency_summary,
+            "Total Amount USD": round(total_usd, 2)
+        })
+
+    df_summary = pd.DataFrame(summary_rows)
+    if df_summary.empty:
+        return pd.DataFrame(columns=[
+            "Operating Unit", "Transaction Count", "Currency Summary", "Total Amount USD"
+        ])
+
+    # Sort by USD amount descending
+    df_summary = df_summary.sort_values("Total Amount USD", ascending=False).reset_index(drop=True)
+
+    # Add grand total row
+    grand_total = pd.DataFrame([{
+        "Operating Unit": "GRAND TOTAL",
+        "Transaction Count": df_summary["Transaction Count"].sum(),
+        "Currency Summary": "—",
+        "Total Amount USD": df_summary["Total Amount USD"].sum()
+    }])
+
+    df_summary = pd.concat([df_summary, grand_total], ignore_index=True)
+
+    return df_summary
+
+def build_wo_fallback(conn, source_df: pd.DataFrame, applied_df: pd.DataFrame):
+    src = source_df.copy()
+    src["Class"] = src["Class"].apply(normalize_class)
+    src["Account Number"] = src["Account Number"].astype(str).str.strip()
+    src["Operating Unit"] = src["Operating Unit"].astype(str).str.strip()
+    src["Currency"] = src["Currency"].astype(str).str.strip()
+    src["Open Balance"] = pd.to_numeric(src["Open Balance"], errors="coerce").fillna(0.0)
+    src["TRX DATE"] = pd.to_datetime(src["TRX DATE"], errors="coerce")
+
+    cm_accounts = set(src.loc[src["Class"] == "Credit Memo", "Account Number"].dropna().astype(str))
+    matched_accounts = set(applied_df["Account Number"].dropna().astype(str)) if not applied_df.empty else set()
+    pending_accounts = sorted(cm_accounts - matched_accounts)
+
+    print(f"Pending accounts for WO: {len(pending_accounts)}")
+    print("First pending accounts:", pending_accounts[:20])
+
+    update_concat_for_unmatched(pending_accounts)
+
+    raw_empty = pd.DataFrame(columns=[
+        "Transaction Number", "Transaction Type", "Transaction Date", "Account Number", "Operating Unit",
+        "Entered Currency", "Entered Amount", "Adjustment Number", "Reason Code"
+    ])
+    match_empty = pd.DataFrame(columns=[
+        "Account Number", "Operating Unit", "Currency", "Credit Memo Number", "Credit Memo TRX Type",
+        "Credit Memo Date", "Credit Memo Open Balance", "WO Transaction Number", "WO Transaction Type",
+        "WO Transaction Date", "WO Entered Amount", "WO Reason Code", "Applied Amount"
+    ])
+
+    if not pending_accounts:
+        return raw_empty, match_empty
+
+    wo_parts = []
+    for i in range(0, len(pending_accounts), 1000):
+        acc_chunk = pending_accounts[i:i + 1000]
+        placeholders = ", ".join(f":acc{j}" for j in range(len(acc_chunk)))
+        sql = WO_PER_OID_QUERY.format(placeholders=placeholders)
+        params = {f"acc{j}": v for j, v in enumerate(acc_chunk)}
+        wo_parts.append(run_query(conn, sql, params))
+
+    df_wo = pd.concat(wo_parts, ignore_index=True) if wo_parts else raw_empty.copy()
+    df_wo = df_wo.drop_duplicates().reset_index(drop=True)
+
+    print(f"WO raw rows returned: {len(df_wo)}")
+
+    if df_wo.empty:
+        return df_wo, match_empty
+
+    df_wo["Account Number"] = df_wo["Account Number"].astype(str).str.strip()
+    df_wo["Operating Unit"] = df_wo["Operating Unit"].astype(str).str.strip()
+    df_wo["Entered Currency"] = df_wo["Entered Currency"].astype(str).str.strip()
+    df_wo["Entered Amount"] = pd.to_numeric(df_wo["Entered Amount"], errors="coerce").fillna(0.0)
+    df_wo["Transaction Date"] = pd.to_datetime(df_wo["Transaction Date"], errors="coerce")
+
+    df_wo_group = df_wo[
+        df_wo["Transaction Type"].astype(str).str.contains("GROUP", case=False, na=False)
+    ].copy()
+
+    unmatched_cms = src[
+        (src["Class"] == "Credit Memo") &
+        (src["Account Number"].isin(pending_accounts))
+    ].copy()
+
+    rows = []
+
+    # NOW GROUPING BY OPERATING UNIT TOO - ensures CM and WO are in same OU
+    for (account, ou, currency), cm_group in unmatched_cms.groupby(["Account Number", "Operating Unit", "Currency"], dropna=False):
+        wo_group = df_wo_group[
+            (df_wo_group["Account Number"] == account) &
+            (df_wo_group["Operating Unit"] == ou) &
+            (df_wo_group["Entered Currency"] == currency)
+        ].copy()
+
+        if wo_group.empty:
+            continue
+
+        cm_group = cm_group.sort_values(["TRX DATE", "Transaction Number"], kind="stable").copy()
+        wo_group = wo_group.sort_values(["Transaction Date", "Transaction Number", "Adjustment Number"], kind="stable").copy()
+        wo_group["remaining_wo_amount"] = wo_group["Entered Amount"].abs().round(2)
+
+        for _, cm in cm_group.iterrows():
+            cm_remaining = round(abs(to_num(cm["Open Balance"])), 2)
+            if cm_remaining <= 0:
+                continue
+
+            for wo_idx, wo in wo_group.iterrows():
+                if cm_remaining <= 0:
+                    break
+
+                wo_remaining = round(to_num(wo_group.at[wo_idx, "remaining_wo_amount"]), 2)
+                if wo_remaining <= 0:
+                    continue
+
+                applied = round(min(cm_remaining, wo_remaining), 2)
+                if applied <= 0:
+                    continue
+
+                rows.append({
+                    "Account Number": cm["Account Number"],
+                    "Operating Unit": cm["Operating Unit"],
+                    "Currency": cm["Currency"],
+                    "Credit Memo Number": cm["Transaction Number"],
+                    "Credit Memo TRX Type": cm["TRX Type Name"],
+                    "Credit Memo Date": cm["TRX DATE"],
+                    "Credit Memo Open Balance": round(to_num(cm["Open Balance"]), 2),
+                    "WO Transaction Number": wo["Transaction Number"],
+                    "WO Transaction Type": wo["Transaction Type"],
+                    "WO Transaction Date": wo["Transaction Date"],
+                    "WO Entered Amount": round(to_num(wo["Entered Amount"]), 2),
+                    "WO Reason Code": wo["Reason Code"],
+                    "Applied Amount": applied,
+                })
+
+                cm_remaining = round(cm_remaining - applied, 2)
+                wo_group.at[wo_idx, "remaining_wo_amount"] = round(wo_remaining - applied, 2)
+
+    df_matches = pd.DataFrame(rows)
+    if df_matches.empty:
+        return df_wo, match_empty
+
+    df_matches = df_matches.drop_duplicates().reset_index(drop=True)
+
+    return df_wo, df_matches
+
+def map_operating_unit(trx_type: str) -> str:
+    if not isinstance(trx_type, str):
+        return ""
+    if trx_type.startswith("IT"):
+        return "Venere Net S.r.l."
+    if trx_type.startswith("CH"):
+        return "12305 Expedia Lodging Partner Services Sarl"
+    if trx_type.startswith("US"):
+        return "11105 Expedia, Inc."
+    if trx_type.startswith("TS"):
+        return "14101 Travelscape, LLC"
+    if trx_type.startswith("BR"):
+        return "11115 Expedia do Brasil Agencia"
+    return ""
+
+def map_activity_name(oper_unit: str) -> str:
+    if not isinstance(oper_unit, str):
+        return ""
+
+    ou = oper_unit.upper()
+    if ou.startswith("12305"):
+        return "CH WRITE-OFF BAD DEBT"
+    if ou.startswith("14101"):
+        return "TS WRITE-OFF BAD DEBT"
+    if ou.startswith("11105"):
+        return "US WRITE-OFF BAD DEBT"
+    if ou.startswith("11115"):
+        return "BR WRITE-OFF BAD DEBT"
+    if "VENERE NET S.R.L." in ou:
+        return "IT WRITE-OFF BAD DEBT"
+    return ""
+
+def normalize_reason(reason):
+    if pd.isna(reason) or not isinstance(reason, str) or not reason.strip():
+        return "Uneconomical to Collect"
+    reason_clean = reason.strip().upper()
+    overrides = {
+        "UNECONOMICAL_TO_COLLECT": "Uneconomical to Collect",
+        "SMALL_AMT_REMAINING": "Small Amt Remaining",
+    }
+    if reason_clean in overrides:
+        return overrides[reason_clean]
+    return reason_clean.replace("_", " ").title()
+
+def build_csv_from_aba3(df_aba3: pd.DataFrame, out_dir: Path):
+    if df_aba3 is None or df_aba3.empty:
+        return None
+
+    df_src = df_aba3.copy()
+    df_src["WO Transaction Type"] = df_src["WO Transaction Type"].astype(str).str.strip()
+    df_src["WO Transaction Number"] = df_src["WO Transaction Number"].astype(str).str.strip()
+    df_src["WO Entered Amount"] = pd.to_numeric(df_src["WO Entered Amount"], errors="coerce").fillna(0.0)
+    df_src["Applied Amount"] = pd.to_numeric(df_src["Applied Amount"], errors="coerce").fillna(0.0)
+    df_src["WO Reason Code"] = df_src["WO Reason Code"].astype(str).str.strip()
+
+    df_src = df_src[
+        df_src["WO Transaction Type"].astype(str).str.contains("GROUP", case=False, na=False) &
+        df_src["WO Transaction Number"].notna() &
+        (df_src["WO Transaction Number"] != "") &
+        (df_src["Applied Amount"] > 0)
+    ].copy()
+
+    if df_src.empty:
+        return None
+
+    today = dt.date.today()
+    today_csv_name = today.strftime("%m%d%Y")
+    today_comment = today.strftime("%m/%d/%Y")
+
+    oper_units = df_src["WO Transaction Type"].map(map_operating_unit)
+
+    df_csv = pd.DataFrame()
+    df_csv["Index"] = range(1, len(df_src) + 1)
+    df_csv["Operating Unit"] = oper_units
+    df_csv["Transaction Number"] = df_src["WO Transaction Number"]
+    df_csv["BFB Number"] = ""
+    df_csv["Activity Name"] = oper_units.map(map_activity_name)
+    df_csv["Adjustment Type"] = "Line"
+    df_csv["Amount to be Adjusted"] = (-df_src["Applied Amount"]).round(2)
+    df_csv["Reason"] = df_src["WO Reason Code"].apply(normalize_reason)
+    df_csv["Comments"] = "180+ CM Group " + today_comment
+    df_csv["GL Date"] = ""
+    df_csv["Adjust Date"] = ""
+
+    df_csv = df_csv.drop_duplicates().reset_index(drop=True)
+    df_csv["Index"] = range(1, len(df_csv) + 1)
+
+    csv_name = f"180CMGroup_WOperOID_{today_csv_name}.csv"
+    csv_path = out_dir / csv_name
+    df_csv.to_csv(csv_path, index=False, encoding="cp1252")
+    return csv_path
+
+def clear_apply_credit_memo_data(ws, start_row=11, end_col=21):
+    max_row = ws.max_row
+    for r in range(start_row, max_row + 1):
+        for c in range(1, end_col + 1):
+            ws.cell(r, c).value = None
+
+def write_m4apps_rows(ws, rows, start_row=11):
+    for i, row in enumerate(rows, start=start_row):
+        ws[f"F{i}"] = row["customer_number"]
+        ws[f"N{i}"] = row["apply_customer_number"]
+        ws[f"H{i}"] = row["credit_memo_number"]
+        ws[f"P{i}"] = row["apply_to"]
+        ws[f"S{i}"] = row["apply_amount"]
+        ws[f"T{i}"] = "=TODAY()"
+        ws[f"U{i}"] = "=TODAY()"
+
+def build_m4apps_after_reversal(df_wo_matches: pd.DataFrame, template_path: Path, out_dir: Path):
+    if df_wo_matches is None or df_wo_matches.empty or not template_path.exists():
+        return None
+
+    df = df_wo_matches.copy()
+    df["WO Transaction Type"] = df["WO Transaction Type"].astype(str).str.strip()
+    df["Account Number"] = df["Account Number"].astype(str).str.strip()
+    df["Credit Memo Number"] = df["Credit Memo Number"].astype(str).str.strip()
+    df["WO Transaction Number"] = df["WO Transaction Number"].astype(str).str.strip()
+    df["Applied Amount"] = pd.to_numeric(df["Applied Amount"], errors="coerce").fillna(0.0)
+
+    df = df[
+        df["WO Transaction Type"].astype(str).str.contains("GROUP", case=False, na=False) &
+        (df["Account Number"] != "") &
+        (df["Credit Memo Number"] != "") &
+        (df["WO Transaction Number"] != "") &
+        (df["Applied Amount"] > 0)
+    ].drop_duplicates().reset_index(drop=True)
+
+    if df.empty:
+        return None
+
+    rows = []
+    for _, r in df.iterrows():
+        rows.append({
+            "customer_number": r["Account Number"],
+            "apply_customer_number": r["Account Number"],
+            "credit_memo_number": r["Credit Memo Number"],
+            "apply_to": r["WO Transaction Number"],
+            "apply_amount": round(float(r["Applied Amount"]), 2),
+        })
+
+    wb = load_workbook(template_path, keep_vba=True)
+    ws = wb["Apply Credit Memo"]
+    clear_apply_credit_memo_data(ws)
+    write_m4apps_rows(ws, rows)
+
+    today_name = dt.date.today().strftime("%Y%m%d")
+    out_path = out_dir / f"After Reversal Application {today_name}.xlsm"
+    wb.save(out_path)
+    return out_path
+
+def build_m4apps_no_reversal(df_apply: pd.DataFrame, template_path: Path, out_dir: Path):
+    if df_apply is None or df_apply.empty or not template_path.exists():
+        return None
+
+    df = df_apply.copy()
+    df["Account Number"] = df["Account Number"].astype(str).str.strip()
+    df["Credit Memo Number"] = df["Credit Memo Number"].astype(str).str.strip()
+    df["Applied To Number"] = df["Applied To Number"].astype(str).str.strip()
+    df["Applied Amount"] = pd.to_numeric(df["Applied Amount"], errors="coerce").fillna(0.0)
+
+    df = df[
+        (df["Account Number"] != "") &
+        (df["Credit Memo Number"] != "") &
+        (df["Applied To Number"] != "") &
+        (df["Applied Amount"] > 0)
+    ].drop_duplicates().reset_index(drop=True)
+
+    if df.empty:
+        return None
+
+    rows = []
+    for _, r in df.iterrows():
+        rows.append({
+            "customer_number": r["Account Number"],
+            "apply_customer_number": r["Account Number"],
+            "credit_memo_number": r["Credit Memo Number"],
+            "apply_to": r["Applied To Number"],
+            "apply_amount": round(float(r["Applied Amount"]), 2),
+        })
+
+    wb = load_workbook(template_path, keep_vba=True)
+    ws = wb["Apply Credit Memo"]
+    clear_apply_credit_memo_data(ws)
+    write_m4apps_rows(ws, rows)
+
+    today_name = dt.date.today().strftime("%Y%m%d")
+    out_path = out_dir / f"CM Apply - No reversal {today_name}.xlsm"
+    wb.save(out_path)
+    return out_path
+
+def write_df(ws, df: pd.DataFrame):
+    ws.delete_rows(1, ws.max_row)
+    headers = list(df.columns)
+
+    for c_idx, col in enumerate(headers, start=1):
+        cell = ws.cell(1, c_idx, col)
+        cell.font = Font(name="Arial", bold=True)
+
+    for r_idx, row in enumerate(df.itertuples(index=False), start=2):
+        for c_idx, value in enumerate(row, start=1):
+            cell = ws.cell(r_idx, c_idx, value)
+            cell.font = Font(name="Arial")
+            if isinstance(value, (pd.Timestamp, dt.datetime, dt.date)):
+                cell.number_format = "mm/dd/yyyy"
+
+    autosize(ws)
+    ws.freeze_panes = "A2"
+
+def autosize(ws):
+    for col_cells in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col_cells[0].column)
+        for cell in col_cells:
+            try:
+                val = "" if cell.value is None else str(cell.value)
+            except Exception:
+                val = ""
+            max_len = max(max_len, len(val))
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 12), 40)
+
+def ensure_workbook(path: Path):
+    if path.exists():
+        return load_workbook(path)
+    wb = Workbook()
+    wb.save(path)
+    return load_workbook(path)
+
+def replace_or_create_sheet(wb, name: str):
+    if name in wb.sheetnames:
+        return wb[name]
+    return wb.create_sheet(title=name)
+
+def main():
+    if not PASSWORD or PASSWORD == "CHANGE_ME":
+        raise ValueError("Atualize ORACLE_PASSWORD antes de rodar o script.")
+
+    if not M4APPS_TEMPLATE.exists():
+        raise FileNotFoundError(f"Template M4Apps não encontrado: {M4APPS_TEMPLATE}")
+
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir = make_run_dir(WORK_DIR)
+    output_xlsx = output_workbook_path(run_dir)
+
+    init_oracle()
+
+    with oracledb.connect(user=USERNAME, password=PASSWORD, dsn=DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER SESSION SET CURRENT_SCHEMA = APPS")
+
+        # Fetch currency conversion rates
+        print("[INFO] Fetching currency conversion rates from Oracle GL_DAILY_RATES...")
+        currency_rates = get_currency_rates(conn)
+
+        df_tab1 = run_query(conn, PRIMARY_QUERY_180_CM_GROUP)
+        print(f"[TAB 1] Rows returned: {len(df_tab1)}")
+
+        df_apply = build_cm_apply_details(df_tab1)
+        df_wo_raw, df_wo_matches = build_wo_fallback(conn, df_tab1, df_apply)
+
+    # Build WO summary by Operating Unit with USD conversion
+    print("[INFO] Building WO summary by Operating Unit...")
+    df_wo_summary = build_wo_summary_by_ou(df_wo_matches, currency_rates)
+
+    csv_path = build_csv_from_aba3(df_wo_matches, run_dir)
+    m4apps_after_reversal = build_m4apps_after_reversal(df_wo_matches, M4APPS_TEMPLATE, run_dir)
+    m4apps_no_reversal = build_m4apps_no_reversal(df_apply, M4APPS_TEMPLATE, run_dir)
+
+    wb = ensure_workbook(output_xlsx)
+    ws1 = replace_or_create_sheet(wb, "TAB 1")
+    ws2 = replace_or_create_sheet(wb, "CM apply details")
+    ws3 = replace_or_create_sheet(wb, "WO per OID")
+    ws4 = replace_or_create_sheet(wb, "WO per OID matches")
+    ws5 = replace_or_create_sheet(wb, "WO Summary by OU")
+
+    write_df(ws1, df_tab1)
+    write_df(ws2, df_apply)
+    write_df(ws3, df_wo_raw)
+    write_df(ws4, df_wo_matches)
+    write_df(ws5, df_wo_summary)
+
+    if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
+        del wb["Sheet"]
+
+    wb.save(output_xlsx)
+
+    print(f"Output folder: {run_dir}")
+    print(f"Workbook atualizado: {output_xlsx}")
+    print(f"TAB 1: {len(df_tab1)} linhas")
+    print(f"CM apply details: {len(df_apply)} linhas")
+    print(f"WO per OID: {len(df_wo_raw)} linhas")
+    print(f"WO per OID matches: {len(df_wo_matches)} linhas")
+    print(f"WO Summary by OU: {len(df_wo_summary)} linhas (includes grand total)")
+
+    # Print summary for quick view
+    if not df_wo_summary.empty:
+        print("\n=== WO REVERSAL SUMMARY BY OPERATING UNIT ===")
+        for _, row in df_wo_summary.iterrows():
+            ou = row["Operating Unit"]
+            count = int(row["Transaction Count"]) if pd.notna(row["Transaction Count"]) else 0
+            usd_amt = row["Total Amount USD"]
+            print(f"  {ou}: {count} transactions | ${usd_amt:,.2f} USD")
+        print("=" * 50 + "\n")
+
+    if csv_path:
+        print(f"CSV gerado em: {csv_path}")
+    if m4apps_after_reversal:
+        print(f"M4Apps After Reversal: {m4apps_after_reversal}")
+    if m4apps_no_reversal:
+        print(f"M4Apps No Reversal: {m4apps_no_reversal}")
+
+if __name__ == "__main__":
+    main()
