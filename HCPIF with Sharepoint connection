@@ -1,96 +1,49 @@
 # -*- coding: utf-8 -*-
 """
-HCPIF extractor R2.7.5
+HCPIF extractor R2.8.0
+Changes vs R2.7.5:
+
+  CHANGE 1 - Collect Type classification column
+    enrich_hcpif_with_oracle now derives a "Collect Type" column for every row:
+    "HC" when RECEIPT_METHOD_NAME is non-empty and does not contain "EVC" or "Virtual";
+    "EC" otherwise (null, empty, or EVC/Virtual card). Column is included in the
+    Extraction sheet via final_main_cols.
+
+  CHANGE 2 - "NO OID - EC" split into "NO OID - EC" and "NO OID - HC"
+    The former single df_no_oid_ec DataFrame is now split by Collect Type into two
+    separate DataFrames (df_no_oid_ec and df_no_oid_hc) and written to two distinct
+    review tabs: "NO OID - EC" and "NO OID - HC". Both DataFrames remain in the main
+    Extraction sheet unchanged.
+
+  CHANGE 3 - Rows with no OID excluded from all three WebADI outputs
+    df_for_webadi is now filtered through _has_oid() before being passed to any WebADI
+    injection function. Rows where both Found Hotel OID and SLE OID are blank are kept
+    in the Extraction sheet and their respective review tabs but do not appear in the
+    UPDATE, Attach SLE, or OID Creation WebADI files.
+
+  CHANGE 4 - New "NO OID - HC" sheet added to Excel output
+    ExcelWriter block writes df_no_oid_hc to sheet "NO OID - HC" immediately after
+    the existing "NO OID - EC" sheet.
+
+  CHANGE 5 - Updated return signature of enrich_hcpif_with_oracle
+    Return tuple extended from 6 to 7 values: df_no_oid_hc inserted between
+    df_no_oid_ec and df_sle_review. main() unpacking updated accordingly.
+
 Changes vs R2.7.4:
 
-  FIX 1 – SLE OID incorrect matches
+  FIX 1 - SLE OID incorrect matches
     add_sle_oid_from_legal_name now passes the HCPIF Country ISO2 into the Oracle
     hotel-name lookup so that deduplication is done on (HOTEL_NAME_MATCH, COUNTRY_ABBR)
-    instead of name alone. This prevents a hotel whose legal name exists in multiple
-    countries from being matched to the wrong record.
+    instead of name alone.
 
-  FIX 2 – Currency "euro" (and similar words) resolved to None
-    A CURRENCY_WORD_MAP is applied before the KNOWN_CURRENCIES validity check, so
-    free-text values such as "euro", "US dollar", "pound" etc. are converted to their
-    3-letter ISO codes. The DEFAULT_CURRENCY_BY_COUNTRY fallback was already correct
-    but is now a genuine last resort rather than a silent workaround.
+  FIX 2 - Currency words resolved to ISO codes
+    CURRENCY_WORD_MAP applied before KNOWN_CURRENCIES validity check.
 
-  FIX 3 – New "NO OID - EC" review tab
-    After Oracle enrichment, rows where BOTH Found Hotel OID and SLE OID are blank AND
-    the business model (TAI_BM) is NOT "GROUP" (i.e. Expedia Collect / Direct) are
-    written to a separate sheet called "NO OID - EC". They are KEPT in the main
-    Extraction sheet and WEBADI as before.
+  FIX 3 - New "NO OID - EC" review tab (superseded by CHANGE 2 above)
 
-  FIX 4 – Remove Receipt Method from OC WEBADI
-    col_current_rm write block removed from inject_into_webadi.
-    "Current RM" is no longer pushed into column AB of the WEBADI sheet.
+  FIX 4 - Remove Receipt Method from OC WEBADI
 
-  FIX 5 – GROUP filter now also checks SOURCE_SYSTEM (HCA.ATTRIBUTE3)
-    TAI.Business_Model (TAI_BM) returns 'DIR' for some GROUP hotels. The mask_tai_group
-    in enrich_hcpif_with_oracle now also checks HCA.ATTRIBUTE3 (SOURCE_SYSTEM = 'GROUP')
-    so these properties are correctly routed to the "Review - GROUP" tab instead of
-    passing through to the Extraction sheet and WebADI outputs.
-"""
-
-# -------------------- DEFAULT PATHS --------------------
-from pathlib import Path
-import os
-from dotenv import load_dotenv
-
-DEFAULT_INPUT_DIR = r"C:\Users\josenjr\Downloads\HCPIFs"
-DEFAULT_OUTPUT_FILE = r"C:\Users\josenjr\Downloads\HCPIFs\Output\HCPIF_extraction.xlsx"
-
-DEFAULT_WEBADI_UPDATE_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OC WEBADI Update template.xlsm"
-DEFAULT_WEBADI_ATTACH_SLE_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OC WEBADI Attach SLE template.xlsm"
-DEFAULT_OID_CREATION_TEMPLATE = r"C:\Users\josenjr\Downloads\HCPIFs\OID Creation WEBADI.xlsm"
-
-# -------------------- POPPLER / TESSERACT CONFIG --------------------
-
-POPPLER_PATH = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Poppler\poppler-25.12.0\Library\bin"
-
-TESSERACT_EXE = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\tesseract.exe"
-TESSDATA_PREFIX = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Tessdata2\tessdata"
-
-# -------------------- ORACLE CONFIG --------------------
-# Load credentials from .env file
-load_dotenv()
-
-# ⚙️ CONFIGURAÇÃO DE SENHA - LEIA ISTO:
-# Por padrão, o script usa a senha do arquivo .env
-# Se você precisar usar uma senha DIFERENTE temporariamente, descomente a linha abaixo:
-# OVERRIDE_PASSWORD = "SuaSenhaTemporariaAqui"
-# -*- coding: utf-8 -*-
-"""
-HCPIF extractor R2.7.5
-Changes vs R2.7.4:
-
-  FIX 1 – SLE OID incorrect matches
-    add_sle_oid_from_legal_name now passes the HCPIF Country ISO2 into the Oracle
-    hotel-name lookup so that deduplication is done on (HOTEL_NAME_MATCH, COUNTRY_ABBR)
-    instead of name alone. This prevents a hotel whose legal name exists in multiple
-    countries from being matched to the wrong record.
-
-  FIX 2 – Currency "euro" (and similar words) resolved to None
-    A CURRENCY_WORD_MAP is applied before the KNOWN_CURRENCIES validity check, so
-    free-text values such as "euro", "US dollar", "pound" etc. are converted to their
-    3-letter ISO codes. The DEFAULT_CURRENCY_BY_COUNTRY fallback was already correct
-    but is now a genuine last resort rather than a silent workaround.
-
-  FIX 3 – New "NO OID - EC" review tab
-    After Oracle enrichment, rows where BOTH Found Hotel OID and SLE OID are blank AND
-    the business model (TAI_BM) is NOT "GROUP" (i.e. Expedia Collect / Direct) are
-    written to a separate sheet called "NO OID - EC". They are KEPT in the main
-    Extraction sheet and WEBADI as before.
-
-  FIX 4 – Remove Receipt Method from OC WEBADI
-    col_current_rm write block removed from inject_into_webadi.
-    "Current RM" is no longer pushed into column AB of the WEBADI sheet.
-
-  FIX 5 – GROUP filter now also checks SOURCE_SYSTEM (HCA.ATTRIBUTE3)
-    TAI.Business_Model (TAI_BM) returns 'DIR' for some GROUP hotels. The mask_tai_group
-    in enrich_hcpif_with_oracle now also checks HCA.ATTRIBUTE3 (SOURCE_SYSTEM = 'GROUP')
-    so these properties are correctly routed to the "Review - GROUP" tab instead of
-    passing through to the Extraction sheet and WebADI outputs.
+  FIX 5 - GROUP filter now also checks SOURCE_SYSTEM (HCA.ATTRIBUTE3)
 """
 
 # -------------------- DEFAULT PATHS --------------------
@@ -2396,16 +2349,16 @@ def create_sle_match_review_tab(df: pd.DataFrame, df_oracle: pd.DataFrame) -> pd
 
 def enrich_hcpif_with_oracle(
         df: pd.DataFrame, base_columns: List[str]
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if "Expedia ID" not in df.columns:
         print("[WARN] Column 'Expedia ID' not found; skipping Oracle enrichment.")
-        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     expedia_ids = df["Expedia ID"].tolist()
     df_oracle = fetch_oracle_tca(expedia_ids)
     if df_oracle.empty:
         print("[INFO] No Oracle data returned; HCPIF remains without enrichment.")
-        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     df["Expedia ID"] = df["Expedia ID"].astype(str).str.strip()
     if "Country ISO2" not in df.columns:
@@ -2511,6 +2464,15 @@ def enrich_hcpif_with_oracle(
         series_source.str.contains("GROUP", case=False, na=False)
     )
 
+    # --- CHANGE 1: Collect Type classification (HC vs EC) ---
+    # HC = RECEIPT_METHOD_NAME non-empty AND does not contain "EVC" or "Virtual"
+    # EC = null, empty, or contains "EVC" or "Virtual"
+    rm_stripped = series_rm.str.strip()
+    mask_rm_present = rm_stripped.str.len() > 0
+    mask_rm_evc_virtual = series_rm.str.contains("EVC|Virtual", case=False, na=False, regex=True)
+    merged["Collect Type"] = "EC"
+    merged.loc[mask_rm_present & ~mask_rm_evc_virtual, "Collect Type"] = "HC"
+
     mask_excluded = mask_direct_debit | mask_tai_group
 
     df_main_raw = merged[~mask_excluded].copy()
@@ -2522,26 +2484,33 @@ def enrich_hcpif_with_oracle(
     if not df_excluded_group_raw.empty:
         print(f"[INFO] {len(df_excluded_group_raw)} row(s) flagged for GROUP review.")
 
-    # --- FIX 3: NO OID - EC tab ---
-    # Rows where BOTH Found Hotel OID (Hotel OID from TCA query) AND SLE OID are blank,
-    # AND the business model is NOT GROUP (i.e. Expedia Collect / Direct).
+    # --- CHANGE 2: Split no-OID rows into HC and EC review tabs ---
+    # Rows where BOTH Found Hotel OID and SLE OID are blank AND TAI_BM is not GROUP.
     has_hotel_oid = merged["Found Hotel OID"].notna() & (merged["Found Hotel OID"].astype(str).str.strip() != "")
-    has_sle_oid = False  # default
+    has_sle_oid: pd.Series | bool = False
     if "SLE OID" in merged.columns:
-        has_sle_oid = merged["SLE OID"].notna() & (merged["SLE OID"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]) == False)
+        has_sle_oid = merged["SLE OID"].notna() & (~merged["SLE OID"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
     elif "SLE_OID" in merged.columns:
-        has_sle_oid = merged["SLE_OID"].notna() & (merged["SLE_OID"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]) == False)
+        has_sle_oid = merged["SLE_OID"].notna() & (~merged["SLE_OID"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
 
     mask_no_oid_at_all = (~has_hotel_oid) & (~has_sle_oid if isinstance(has_sle_oid, pd.Series) else True)
     mask_not_group = ~series_tai.str.contains("GROUP", case=False, na=False)
-    mask_no_oid_ec = mask_no_oid_at_all & mask_not_group
+    mask_collect_hc = merged["Collect Type"] == "HC"
 
+    mask_no_oid_hc = mask_no_oid_at_all & mask_not_group & mask_collect_hc
+    mask_no_oid_ec = mask_no_oid_at_all & mask_not_group & ~mask_collect_hc
+
+    df_no_oid_hc_raw = merged[mask_no_oid_hc].copy()
     df_no_oid_ec_raw = merged[mask_no_oid_ec].copy()
+    if not df_no_oid_hc_raw.empty:
+        print(f"[INFO] {len(df_no_oid_hc_raw)} row(s) flagged for 'NO OID - HC' review tab.")
     if not df_no_oid_ec_raw.empty:
         print(f"[INFO] {len(df_no_oid_ec_raw)} row(s) flagged for 'NO OID - EC' review tab.")
 
-    extra_cols = ["Found Hotel OID", "Found Hotel Name", "Oracle Currency", "Currency Matches Oracle", "Comments",
-                  "Current RM"]
+    extra_cols = [
+        "Found Hotel OID", "Found Hotel Name", "Oracle Currency",
+        "Currency Matches Oracle", "Comments", "Current RM", "Collect Type",
+    ]
     final_main_cols = list(base_columns)
     for col in extra_cols:
         if col in df_main_raw.columns and col not in final_main_cols:
@@ -2550,12 +2519,15 @@ def enrich_hcpif_with_oracle(
     df_main = df_main_raw.loc[:, final_main_cols].copy()
     df_excluded_dd = df_excluded_dd_raw.loc[:, [c for c in final_main_cols if c in df_excluded_dd_raw.columns]].copy()
     df_excluded_group = df_excluded_group_raw.loc[:, [c for c in final_main_cols if c in df_excluded_group_raw.columns]].copy()
-    df_no_oid_ec = df_no_oid_ec_raw.loc[:, final_main_cols].copy() if not df_no_oid_ec_raw.empty else pd.DataFrame()
+    safe_cols = [c for c in final_main_cols if c in df_no_oid_ec_raw.columns]
+    df_no_oid_ec = df_no_oid_ec_raw.loc[:, safe_cols].copy() if not df_no_oid_ec_raw.empty else pd.DataFrame()
+    safe_cols_hc = [c for c in final_main_cols if c in df_no_oid_hc_raw.columns]
+    df_no_oid_hc = df_no_oid_hc_raw.loc[:, safe_cols_hc].copy() if not df_no_oid_hc_raw.empty else pd.DataFrame()
 
     # Create SLE match review tab
     df_sle_review = create_sle_match_review_tab(df_main, df_oracle)
 
-    return df_main, df_excluded_dd, df_excluded_group, df_oracle_details, df_no_oid_ec, df_sle_review
+    return df_main, df_excluded_dd, df_excluded_group, df_oracle_details, df_no_oid_ec, df_no_oid_hc, df_sle_review
 
 
 def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
@@ -3674,13 +3646,40 @@ def main():
 
     base_columns = list(df.columns)
 
-    df, df_excluded_dd, df_excluded_group, df_oracle_details, df_no_oid_ec, df_sle_review = enrich_hcpif_with_oracle(df, base_columns)
+    df, df_excluded_dd, df_excluded_group, df_oracle_details, df_no_oid_ec, df_no_oid_hc, df_sle_review = enrich_hcpif_with_oracle(df, base_columns)
 
     df = sanitize_legal_name_column(df)
     if not df_excluded_dd.empty:
         df_excluded_dd = sanitize_legal_name_column(df_excluded_dd)
     if not df_excluded_group.empty:
         df_excluded_group = sanitize_legal_name_column(df_excluded_group)
+
+    # --- CHANGE 3: exclude rows with no OID from all three WebADI outputs ---
+    def _has_oid(frame: pd.DataFrame) -> pd.Series:
+        hotel_ok = frame["Found Hotel OID"].notna() & (frame["Found Hotel OID"].astype(str).str.strip() != "")
+        sle_col = "SLE OID" if "SLE OID" in frame.columns else None
+        if sle_col:
+            sle_ok = frame[sle_col].notna() & (~frame[sle_col].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
+        else:
+            sle_ok = pd.Series([False] * len(frame), index=frame.index)
+        return hotel_ok | sle_ok
+
+    if "Found Hotel OID" in df.columns:
+        df_main_webadi = df[_has_oid(df)].copy()
+    else:
+        df_main_webadi = df.copy()
+
+    if not df_excluded_dd.empty and "Found Hotel OID" in df_excluded_dd.columns:
+        df_dd_webadi = df_excluded_dd[_has_oid(df_excluded_dd)].copy()
+    else:
+        df_dd_webadi = df_excluded_dd.copy()
+
+    excluded_count = (len(df) - len(df_main_webadi)) + (len(df_excluded_dd) - len(df_dd_webadi))
+    if excluded_count > 0:
+        print(f"[INFO] {excluded_count} row(s) excluded from WebADI outputs (no Found Hotel OID and no SLE OID).")
+
+    # DD rows stay out of the main Extraction sheet but must appear in all 3 WebADIs
+    df_for_webadi = pd.concat([df_main_webadi, df_dd_webadi], ignore_index=True) if not df_dd_webadi.empty else df_main_webadi
 
     # ── NEW: SF Report "Rebill Request" check ──────────────────────────
     df, df_rebill = check_sf_report_rebill(df, run_dir)
@@ -3708,11 +3707,11 @@ def main():
             "Last Name",
             "Email Address",
             "SLE OID",
-        ] if c in df.columns
+        ] if c in df_for_webadi.columns
     ]
 
-    df_oid_creation = df.loc[
-        (df["Expedia ID"].notna()) | (df["Legal Name"].notna()),
+    df_oid_creation = df_for_webadi.loc[
+        (df_for_webadi["Expedia ID"].notna()) | (df_for_webadi["Legal Name"].notna()),
         oid_need_cols,
     ].copy()
 
@@ -3741,13 +3740,17 @@ def main():
                 print(f"[INFO] {len(df_rebill)} row(s) written to 'Review - Existing Rebill' tab.")
             # ── END NEW ────────────────────────────────────────────────────
 
-            # ── NEW: write NO OID - EC tab ──────────────────────────────────
+            # --- CHANGE 2 / CHANGE 4: NO OID split tabs ---
             if not df_no_oid_ec.empty:
                 df_no_oid_ec.to_excel(
                     writer, sheet_name="NO OID - EC", index=False
                 )
                 print(f"[INFO] {len(df_no_oid_ec)} row(s) written to 'NO OID - EC' tab.")
-            # ── END NEW ────────────────────────────────────────────────────
+            if not df_no_oid_hc.empty:
+                df_no_oid_hc.to_excel(
+                    writer, sheet_name="NO OID - HC", index=False
+                )
+                print(f"[INFO] {len(df_no_oid_hc)} row(s) written to 'NO OID - HC' tab.")
 
             # ── NEW: write Review - SLE Match tab ──────────────────────────
             if not df_sle_review.empty:
@@ -3786,13 +3789,13 @@ def main():
         "First Name", "Last Name", "Email Address", "Preferred Language",
     }
 
-    present = [c for c in need_cols if c in df.columns]
+    present = [c for c in need_cols if c in df_for_webadi.columns]
     # Always include file_name if it exists
-    if "file_name" in df.columns and "file_name" not in present:
+    if "file_name" in df_for_webadi.columns and "file_name" not in present:
         present.append("file_name")
     if present:
-        df_webadi = df.loc[
-            (df["Expedia ID"].notna()) | (df["Legal Name"].notna()),
+        df_webadi = df_for_webadi.loc[
+            (df_for_webadi["Expedia ID"].notna()) | (df_for_webadi["Legal Name"].notna()),
             present,
         ].copy()
 
