@@ -1,0 +1,270 @@
+import os
+import sys
+import logging
+from pathlib import Path
+from datetime import date
+
+import oracledb
+import pandas as pd
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
+USERNAME = os.getenv("ORACLE_USER",     "xxx")
+PASSWORD = os.getenv("ORACLE_PASSWORD", "XXX")
+DSN      = os.getenv("ORACLE_DSN",      "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI")
+
+# ===================== PARAMETROS <<< mude aqui
+LEDGER_NAME = "Brazil PL"
+PERIOD_NAME = "JUL-26"
+COMPANY     = "11115"
+ACCOUNTS    = ("113001", "113100")
+AR_APP_ID   = 222
+# =====================
+
+DOWNLOADS_DIR = Path(os.path.expanduser("~")) / "Downloads"
+today_str     = date.today().strftime("%Y%m%d")
+OUTPUT_FILE   = DOWNLOADS_DIR / ("Brazil_GL_Subledger_" + PERIOD_NAME.replace("-", "_") + "_" + today_str + ".csv")
+
+# ------------------------------------------------------------------
+# QUERY PRINCIPAL
+# Base: XLA (1 linha por transacao, sem cartesiano)
+# GL_DATE e contexto do batch: subquery agregada no GL (1 linha por grupo+categoria)
+# Party: SOURCE_ID_INT_1 -> AR_CASH_RECEIPTS_ALL -> HZ_CUST_ACCOUNTS -> HZ_PARTIES
+# ------------------------------------------------------------------
+MAIN_QUERY = (
+    "SELECT"
+
+    # === COA (do GL_CODE_COMBINATIONS via XLA) ===
+    " gcc.SEGMENT1                                        AS LEDGER_NAME,"
+    " gcc.SEGMENT1                                        AS COMPANY,"
+    " gcc.SEGMENT2                                        AS ACCOUNT,"
+    " gcc.SEGMENT3                                        AS DEPARTMENT,"
+    " gcc.SEGMENT4                                        AS MANAGEMENT_UNIT,"
+    " gcc.SEGMENT5                                        AS OFFICE,"
+    " gcc.SEGMENT6                                        AS PROJECT,"
+    " gcc.SEGMENT7                                        AS PRODUCT,"
+    " gcc.SEGMENT8                                        AS INTERCO,"
+
+    # === PERIODO ===
+    " TO_NUMBER(TO_CHAR(xh.ACCOUNTING_DATE,'YYYY'))       AS PERIOD_YEAR,"
+    " TO_NUMBER(TO_CHAR(xh.ACCOUNTING_DATE,'MM'))         AS PERIOD_NUMBER,"
+    " xh.PERIOD_NAME,"
+
+    # === GL DATE (do GL via subquery) ===
+    " glc.GL_DATE,"
+    " glc.GL_BATCH_NAME,"
+    " glc.POSTED_DATE,"
+    " glc.GL_JE_NAME,"
+    " glc.JE_SOURCE_NAME,"
+    " xh.JE_CATEGORY_NAME                                AS JOURNAL_CATEGORY,"
+    " glc.HEADER_DESCRIPTION,"
+
+    # === SUBLEDGER ===
+    " xet.EVENT_CLASS_CODE                               AS EVENT_CLASS_NAME,"
+    " hp.PARTY_NUMBER,"
+    " hp.PARTY_NAME,"
+    " xte.TRANSACTION_NUMBER,"
+    " xh.ACCOUNTING_DATE                                 AS TRANSACTION_DATE,"
+
+    # === LINHA XLA ===
+    " xl.AE_LINE_NUM                                     AS GL_LINE_NUMBER,"
+    " xl.DESCRIPTION                                     AS GL_LINE_DESCRIPTION,"
+    " glc.CREATED_BY,"
+
+    # === CONVERSAO (do GL via subquery) ===
+    " glc.CONVERSION_RATE,"
+    " glc.CONVERSION_RATE_DATE,"
+    " glc.CONVERSION_RATE_TYPE,"
+    " glc.ENTERED_CURRENCY,"
+
+    # === VALORES (do XLA - perspectiva GL: DR=debito na conta, CR=credito na conta) ===
+    # XLA_AE_LINES.ENTERED_DR/CR ja reflete a perspectiva da conta contabil
+    " NVL(xl.ENTERED_DR, 0)                              AS ENTERED_DEBIT,"
+    " NVL(xl.ENTERED_CR, 0)                              AS ENTERED_CREDIT,"
+    " NVL(xl.ENTERED_DR, 0) - NVL(xl.ENTERED_CR, 0)     AS ENTERED_AMT,"
+    " glc.ENTERED_CURRENCY                               AS LEDGER_CURRENCY,"
+    " NVL(xl.ACCOUNTED_DR, 0)                            AS ACCOUNTED_DEBIT,"
+    " NVL(xl.ACCOUNTED_CR, 0)                            AS ACCOUNTED_CREDIT,"
+    " NVL(xl.ACCOUNTED_DR, 0) - NVL(xl.ACCOUNTED_CR, 0) AS ACCTD_AMT"
+
+    " FROM XLA.XLA_AE_HEADERS xh"
+    " JOIN XLA.XLA_AE_LINES xl"
+    "   ON xl.AE_HEADER_ID = xh.AE_HEADER_ID"
+    "  AND xl.APPLICATION_ID = :ar_app_id"
+    " JOIN XLA.XLA_TRANSACTION_ENTITIES xte"
+    "   ON xte.ENTITY_ID = xh.ENTITY_ID"
+    "  AND xte.APPLICATION_ID = :ar_app_id"
+    " LEFT JOIN XLA.XLA_EVENT_TYPES_B xet"
+    "   ON xet.EVENT_TYPE_CODE = xh.EVENT_TYPE_CODE"
+    "  AND xet.APPLICATION_ID = :ar_app_id"
+
+    # Party chain confirmada: SOURCE_ID_INT_1 = CASH_RECEIPT_ID
+    " LEFT JOIN AR.AR_CASH_RECEIPTS_ALL acr"
+    "   ON acr.CASH_RECEIPT_ID = xte.SOURCE_ID_INT_1"
+    " LEFT JOIN AR.HZ_CUST_ACCOUNTS hca"
+    "   ON hca.CUST_ACCOUNT_ID = acr.PAY_FROM_CUSTOMER"
+    " LEFT JOIN AR.HZ_PARTIES hp"
+    "   ON hp.PARTY_ID = hca.PARTY_ID"
+
+    # COA para filtrar por segmento
+    " JOIN GL.GL_CODE_COMBINATIONS gcc"
+    "   ON gcc.CODE_COMBINATION_ID = xl.CODE_COMBINATION_ID"
+
+    # GL context: 1 linha por GL_GROUP_ID + JE_CATEGORY (sem cartesiano)
+    # GROUP_ID extraido do BATCH_NAME: 'Receivables A {GROUP_ID} {REQUEST_ID}'
+    " LEFT JOIN ("
+    "   SELECT"
+    "     gjb.NAME AS GL_BATCH_NAME,"
+    "     TO_NUMBER(REGEXP_SUBSTR(gjb.NAME, '[0-9]+', 1, 1)) AS GL_GROUP_ID,"
+    "     CASE gjh.JE_CATEGORY WHEN 'Adjustment' THEN 'Adjustment' WHEN 'Adjustments' THEN 'Adjustment' ELSE gjh.JE_CATEGORY END AS JE_CATEGORY,"
+    "     MIN(gjh.DEFAULT_EFFECTIVE_DATE) AS GL_DATE,"
+    "     MIN(gjh.POSTED_DATE)            AS POSTED_DATE,"
+    "     MIN(gjh.NAME)                   AS GL_JE_NAME,"
+    "     MIN(gjh.JE_SOURCE)              AS JE_SOURCE_NAME,"
+    "     MIN(gjh.DESCRIPTION)            AS HEADER_DESCRIPTION,"
+    "     MIN(fu.USER_NAME)               AS CREATED_BY,"
+    "     MIN(gjh.CURRENCY_CONVERSION_RATE) AS CONVERSION_RATE,"
+    "     MIN(gjh.CURRENCY_CONVERSION_DATE) AS CONVERSION_RATE_DATE,"
+    "     MIN(gjh.CURRENCY_CONVERSION_TYPE) AS CONVERSION_RATE_TYPE,"
+    "     MIN(gjh.CURRENCY_CODE)          AS ENTERED_CURRENCY"
+    "   FROM GL.GL_JE_HEADERS gjh"
+    "   JOIN GL.GL_JE_BATCHES gjb ON gjb.JE_BATCH_ID = gjh.JE_BATCH_ID"
+    "   LEFT JOIN APPLSYS.FND_USER fu ON fu.USER_ID = gjh.CREATED_BY"
+    "   WHERE gjh.STATUS = 'P'"
+    "   AND gjh.ACTUAL_FLAG = 'A'"
+    "   AND gjh.PERIOD_NAME = :period_name"
+    "   AND gjh.JE_SOURCE = 'Receivables'"
+    "   AND gjh.CURRENCY_CODE <> 'STAT'"
+    "   AND gjh.LEDGER_ID = (SELECT LEDGER_ID FROM GL.GL_LEDGERS WHERE NAME = :ledger_name)"
+    "   GROUP BY gjb.NAME, TO_NUMBER(REGEXP_SUBSTR(gjb.NAME, '[0-9]+', 1, 1)), CASE gjh.JE_CATEGORY WHEN 'Adjustment' THEN 'Adjustment' WHEN 'Adjustments' THEN 'Adjustment' ELSE gjh.JE_CATEGORY END"
+    " ) glc"
+    "   ON glc.GL_GROUP_ID = xh.GROUP_ID"
+    "  AND glc.JE_CATEGORY = CASE xh.JE_CATEGORY_NAME WHEN 'Adjustments' THEN 'Adjustment' ELSE xh.JE_CATEGORY_NAME END"
+
+    " WHERE xh.APPLICATION_ID = :ar_app_id"
+    " AND xh.LEDGER_ID = (SELECT LEDGER_ID FROM GL.GL_LEDGERS WHERE NAME = :ledger_name)"
+    " AND xh.PERIOD_NAME = :period_name"
+    " AND xh.JE_CATEGORY_NAME IN ('Receipts','Adjustment','Adjustments','Credit Memos','Debit Memos','Trade Receipts','Sales Invoices','Miscellaneous Receipts')"
+    " AND gcc.SEGMENT1 = :company"
+    " AND gcc.SEGMENT2 IN ('113001','113100')"
+
+    " ORDER BY xh.ACCOUNTING_DATE, glc.GL_BATCH_NAME, xl.AE_LINE_NUM"
+)
+
+
+def initialize_oracle_client():
+    try:
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
+        logger.info("Oracle client initialized")
+    except Exception as e:
+        logger.error(f"Oracle client init failed: {e}")
+        raise
+
+
+def get_oracle_connection(max_retries=3):
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Connecting to Oracle (attempt {attempt}/{max_retries})...")
+            conn = oracledb.connect(user=USERNAME, password=PASSWORD, dsn=DSN)
+            with conn.cursor() as cur:
+                cur.execute("ALTER SESSION SET CURRENT_SCHEMA = APPS")
+            logger.info("Connected successfully")
+            return conn
+        except oracledb.DatabaseError as e:
+            if attempt == max_retries:
+                raise
+            logger.warning(f"Attempt {attempt} failed, retrying...")
+    return None
+
+
+def fetch_query(conn, sql, params):
+    CHUNK = 5000
+    chunks = []
+    with conn.cursor() as cur:
+        cur.arraysize = CHUNK
+        cur.execute(sql, params)
+        cols = [d[0].upper() for d in cur.description]
+        while True:
+            batch = cur.fetchmany(CHUNK)
+            if not batch:
+                break
+            chunks.append(pd.DataFrame(batch, columns=cols))
+    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=cols)
+
+
+def main():
+    logger.info("=" * 60)
+    logger.info("Brazil GL Subledger Export - v6 FINAL")
+    logger.info(f"  Ledger  : {LEDGER_NAME}")
+    logger.info(f"  Period  : {PERIOD_NAME}")
+    logger.info(f"  Company : {COMPANY}")
+    logger.info(f"  Accounts: {ACCOUNTS}")
+    logger.info("  Strategy: XLA base + GL context subquery (no cartesian)")
+    logger.info("=" * 60)
+
+    initialize_oracle_client()
+    conn = get_oracle_connection()
+
+    params = {
+        "ar_app_id":   AR_APP_ID,
+        "ledger_name": LEDGER_NAME,
+        "period_name": PERIOD_NAME,
+        "company":     COMPANY,
+    }
+
+    try:
+        logger.info("Executing main query...")
+        df = fetch_query(conn, MAIN_QUERY, params)
+        logger.info(f"  Rows fetched: {len(df):,}")
+
+    except oracledb.DatabaseError as e:
+        logger.error(f"Oracle error: {e}")
+        sys.exit(1)
+    finally:
+        if conn:
+            conn.close()
+            logger.info("Connection closed")
+
+    if df.empty:
+        logger.warning("No data returned.")
+        sys.exit(0)
+
+    # Fix LEDGER_NAME
+    df["LEDGER_NAME"] = LEDGER_NAME
+
+    # Save CSV
+    df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+    logger.info(f"  Saved: {OUTPUT_FILE}")
+
+    # Validation
+    logger.info("=" * 60)
+    logger.info("VALIDATION BY ACCOUNT")
+    for acct in ACCOUNTS:
+        sub = df[df["ACCOUNT"].astype(str) == acct]
+        if sub.empty:
+            logger.info(f"  Account {acct}: no data")
+            continue
+        net   = sub["ENTERED_AMT"].sum()
+        pn_ok = sub["PARTY_NAME"].notna().sum()
+        tn_ok = sub["TRANSACTION_NUMBER"].notna().sum()
+        gd_ok = sub["GL_DATE"].notna().sum()
+        logger.info(
+            f"  Account {acct}: {len(sub):,} rows | "
+            f"Net={net:>15,.2f} | "
+            f"Party={pn_ok:,}/{len(sub):,} | "
+            f"TrxNum={tn_ok:,}/{len(sub):,} | "
+            f"GL_Date={gd_ok:,}/{len(sub):,}"
+        )
+    logger.info("=" * 60)
+    logger.info(f"DONE: {OUTPUT_FILE}")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
