@@ -15,8 +15,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
-USERNAME = os.getenv("ORACLE_USER",     "xxx")
-PASSWORD = os.getenv("ORACLE_PASSWORD", "XXX")
+USERNAME = os.getenv("ORACLE_USER",     "xxxxxxxxx")
+PASSWORD = os.getenv("ORACLE_PASSWORD", "xxxxxxx")
 DSN      = os.getenv("ORACLE_DSN",      "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI")
 
 # ===================== PARAMETROS <<< mude aqui
@@ -122,7 +122,7 @@ MAIN_QUERY = (
     "   SELECT"
     "     gjb.NAME AS GL_BATCH_NAME,"
     "     TO_NUMBER(REGEXP_SUBSTR(gjb.NAME, '[0-9]+', 1, 1)) AS GL_GROUP_ID,"
-    "     CASE gjh.JE_CATEGORY WHEN 'Adjustment' THEN 'Adjustment' WHEN 'Adjustments' THEN 'Adjustment' ELSE gjh.JE_CATEGORY END AS JE_CATEGORY,"
+    "     CASE gjh.JE_CATEGORY WHEN 'Adjustments' THEN 'Adjustment' ELSE gjh.JE_CATEGORY END AS JE_CATEGORY,"
     "     MIN(gjh.DEFAULT_EFFECTIVE_DATE) AS GL_DATE,"
     "     MIN(gjh.POSTED_DATE)            AS POSTED_DATE,"
     "     MIN(gjh.NAME)                   AS GL_JE_NAME,"
@@ -142,10 +142,10 @@ MAIN_QUERY = (
     "   AND gjh.JE_SOURCE = 'Receivables'"
     "   AND gjh.CURRENCY_CODE <> 'STAT'"
     "   AND gjh.LEDGER_ID = (SELECT LEDGER_ID FROM GL.GL_LEDGERS WHERE NAME = :ledger_name)"
-    "   GROUP BY gjb.NAME, TO_NUMBER(REGEXP_SUBSTR(gjb.NAME, '[0-9]+', 1, 1)), CASE gjh.JE_CATEGORY WHEN 'Adjustment' THEN 'Adjustment' WHEN 'Adjustments' THEN 'Adjustment' ELSE gjh.JE_CATEGORY END"
+    "   GROUP BY gjb.NAME, TO_NUMBER(REGEXP_SUBSTR(gjb.NAME, '[0-9]+', 1, 1)), CASE gjh.JE_CATEGORY WHEN 'Adjustments' THEN 'Adjustment' ELSE gjh.JE_CATEGORY END"
     " ) glc"
     "   ON glc.GL_GROUP_ID = xh.GROUP_ID"
-    "  AND glc.JE_CATEGORY = CASE xh.JE_CATEGORY_NAME WHEN 'Adjustments' THEN 'Adjustment' ELSE xh.JE_CATEGORY_NAME END"
+    "  AND glc.JE_CATEGORY = xh.JE_CATEGORY_NAME"
 
     " WHERE xh.APPLICATION_ID = :ar_app_id"
     " AND xh.LEDGER_ID = (SELECT LEDGER_ID FROM GL.GL_LEDGERS WHERE NAME = :ledger_name)"
@@ -222,6 +222,9 @@ def main():
         logger.info("Executing main query...")
         df = fetch_query(conn, MAIN_QUERY, params)
         logger.info(f"  Rows fetched: {len(df):,}")
+        logger.info("  Category breakdown:")
+        for cat, cnt in df["JOURNAL_CATEGORY"].value_counts().items():
+            logger.info(f"    {cat}: {cnt:,}")
 
     except oracledb.DatabaseError as e:
         logger.error(f"Oracle error: {e}")
