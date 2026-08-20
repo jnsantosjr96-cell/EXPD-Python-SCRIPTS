@@ -1,3 +1,39 @@
+"""
+Brazil GL with Subledger Detail - Export Script
+================================================
+Replica o report "EXPD GL with Subledger Detail" do OBI para Oracle EBS.
+
+ESTRATEGIA:
+  - Base: XLA_AE_LINES (1 linha por transacao, sem cartesiano)
+  - GL context (GL_DATE, Batch Name etc): subquery agregada por GROUP_ID + JE_CATEGORY
+  - Party Name: SOURCE_ID_INT_1 -> AR_CASH_RECEIPTS_ALL -> HZ_CUST_ACCOUNTS -> HZ_PARTIES
+  - GROUP_ID extraido do BATCH_NAME: "Receivables A {GROUP_ID} {REQUEST_ID}"
+
+SCHEMAS UTILIZADOS:
+  - XLA  : XLA_AE_HEADERS, XLA_AE_LINES, XLA_TRANSACTION_ENTITIES, XLA_EVENT_TYPES_B
+  - GL   : GL_JE_HEADERS, GL_JE_LINES, GL_JE_BATCHES, GL_LEDGERS, GL_CODE_COMBINATIONS
+  - AR   : AR_CASH_RECEIPTS_ALL, HZ_CUST_ACCOUNTS, HZ_PARTIES
+  - APPLSYS: FND_USER
+
+VALIDADO CONTRA:
+  - OBI report "EXPD GL with Subledger Detail" (JUL-26, Company 11115, Accounts 113001/113100)
+  - MXM Closing report Brazil JUL-26
+  - Net 113001: -80,047.76 | Linhas: 25,770 | Execucao: ~20 segundos
+
+PARAMETROS (alterar no topo do arquivo):
+  LEDGER_NAME  : nome do ledger (ex: "Brazil PL")
+  PERIOD_NAME  : periodo Oracle (ex: "AUG-26", "SEP-26")
+  COMPANY      : segmento 1 do COA (ex: "11115")
+  ACCOUNTS     : tuple de contas segmento 2 (ex: ("113001", "113100"))
+
+OUTPUT:
+  CSV em ~/Downloads/Brazil_GL_Subledger_{PERIOD}_{DATE}.csv
+  Encoding UTF-8 BOM (compativel com Excel)
+
+Author : Jose Santos (josenjr@expediagroup.com)
+Created: 2026-08-18
+"""
+
 import os
 import sys
 import logging
@@ -7,6 +43,9 @@ from datetime import date
 import oracledb
 import pandas as pd
 
+# ==========================
+# LOGGING
+# ==========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -14,33 +53,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==========================
+# ORACLE CONFIG
+# ==========================
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
-USERNAME = os.getenv("ORACLE_USER",     "xxxxxxxxx")
-PASSWORD = os.getenv("ORACLE_PASSWORD", "xxxxxxx")
+USERNAME = os.getenv("ORACLE_USER",     "XXXXX")
+PASSWORD = os.getenv("ORACLE_PASSWORD", "XXXXXXX")
 DSN      = os.getenv("ORACLE_DSN",      "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI")
 
-# ===================== PARAMETROS <<< mude aqui
+# ==========================
+# PARAMETROS  <<< MUDE AQUI
+# ==========================
 LEDGER_NAME = "Brazil PL"
 PERIOD_NAME = "JUL-26"
 COMPANY     = "11115"
 ACCOUNTS    = ("113001", "113100")
-AR_APP_ID   = 222
-# =====================
+AR_APP_ID   = 222          # Application ID do AR no Oracle EBS - nao alterar
 
+# ==========================
+# OUTPUT
+# ==========================
 DOWNLOADS_DIR = Path(os.path.expanduser("~")) / "Downloads"
 today_str     = date.today().strftime("%Y%m%d")
-OUTPUT_FILE   = DOWNLOADS_DIR / ("Brazil_GL_Subledger_" + PERIOD_NAME.replace("-", "_") + "_" + today_str + ".csv")
+OUTPUT_FILE   = DOWNLOADS_DIR / (
+    "Brazil_GL_Subledger_"
+    + PERIOD_NAME.replace("-", "_")
+    + "_" + today_str + ".csv"
+)
 
-# ------------------------------------------------------------------
+# ==========================
 # QUERY PRINCIPAL
-# Base: XLA (1 linha por transacao, sem cartesiano)
-# GL_DATE e contexto do batch: subquery agregada no GL (1 linha por grupo+categoria)
-# Party: SOURCE_ID_INT_1 -> AR_CASH_RECEIPTS_ALL -> HZ_CUST_ACCOUNTS -> HZ_PARTIES
-# ------------------------------------------------------------------
+# ==========================
 MAIN_QUERY = (
     "SELECT"
 
-    # === COA (do GL_CODE_COMBINATIONS via XLA) ===
+    # COA (via GL_CODE_COMBINATIONS)
     " gcc.SEGMENT1                                        AS LEDGER_NAME,"
     " gcc.SEGMENT1                                        AS COMPANY,"
     " gcc.SEGMENT2                                        AS ACCOUNT,"
@@ -51,12 +98,12 @@ MAIN_QUERY = (
     " gcc.SEGMENT7                                        AS PRODUCT,"
     " gcc.SEGMENT8                                        AS INTERCO,"
 
-    # === PERIODO ===
+    # Periodo
     " TO_NUMBER(TO_CHAR(xh.ACCOUNTING_DATE,'YYYY'))       AS PERIOD_YEAR,"
     " TO_NUMBER(TO_CHAR(xh.ACCOUNTING_DATE,'MM'))         AS PERIOD_NUMBER,"
     " xh.PERIOD_NAME,"
 
-    # === GL DATE (do GL via subquery) ===
+    # GL context (via subquery)
     " glc.GL_DATE,"
     " glc.GL_BATCH_NAME,"
     " glc.POSTED_DATE,"
@@ -65,26 +112,25 @@ MAIN_QUERY = (
     " xh.JE_CATEGORY_NAME                                AS JOURNAL_CATEGORY,"
     " glc.HEADER_DESCRIPTION,"
 
-    # === SUBLEDGER ===
+    # Subledger
     " xet.EVENT_CLASS_CODE                               AS EVENT_CLASS_NAME,"
     " hp.PARTY_NUMBER,"
     " hp.PARTY_NAME,"
     " xte.TRANSACTION_NUMBER,"
     " xh.ACCOUNTING_DATE                                 AS TRANSACTION_DATE,"
 
-    # === LINHA XLA ===
+    # Linha XLA
     " xl.AE_LINE_NUM                                     AS GL_LINE_NUMBER,"
     " xl.DESCRIPTION                                     AS GL_LINE_DESCRIPTION,"
     " glc.CREATED_BY,"
 
-    # === CONVERSAO (do GL via subquery) ===
+    # Conversao
     " glc.CONVERSION_RATE,"
     " glc.CONVERSION_RATE_DATE,"
     " glc.CONVERSION_RATE_TYPE,"
     " glc.ENTERED_CURRENCY,"
 
-    # === VALORES (do XLA - perspectiva GL: DR=debito na conta, CR=credito na conta) ===
-    # XLA_AE_LINES.ENTERED_DR/CR ja reflete a perspectiva da conta contabil
+    # Valores (perspectiva da conta contabil via XLA)
     " NVL(xl.ENTERED_DR, 0)                              AS ENTERED_DEBIT,"
     " NVL(xl.ENTERED_CR, 0)                              AS ENTERED_CREDIT,"
     " NVL(xl.ENTERED_DR, 0) - NVL(xl.ENTERED_CR, 0)     AS ENTERED_AMT,"
@@ -104,7 +150,7 @@ MAIN_QUERY = (
     "   ON xet.EVENT_TYPE_CODE = xh.EVENT_TYPE_CODE"
     "  AND xet.APPLICATION_ID = :ar_app_id"
 
-    # Party chain confirmada: SOURCE_ID_INT_1 = CASH_RECEIPT_ID
+    # Party: SOURCE_ID_INT_1 = CASH_RECEIPT_ID (confirmado para AR Receipts)
     " LEFT JOIN AR.AR_CASH_RECEIPTS_ALL acr"
     "   ON acr.CASH_RECEIPT_ID = xte.SOURCE_ID_INT_1"
     " LEFT JOIN AR.HZ_CUST_ACCOUNTS hca"
@@ -112,12 +158,12 @@ MAIN_QUERY = (
     " LEFT JOIN AR.HZ_PARTIES hp"
     "   ON hp.PARTY_ID = hca.PARTY_ID"
 
-    # COA para filtrar por segmento
+    # Filtro por segmento
     " JOIN GL.GL_CODE_COMBINATIONS gcc"
     "   ON gcc.CODE_COMBINATION_ID = xl.CODE_COMBINATION_ID"
 
-    # GL context: 1 linha por GL_GROUP_ID + JE_CATEGORY (sem cartesiano)
-    # GROUP_ID extraido do BATCH_NAME: 'Receivables A {GROUP_ID} {REQUEST_ID}'
+    # GL context: 1 linha por GROUP_ID + JE_CATEGORY (sem cartesiano)
+    # GROUP_ID = 1o numero do BATCH_NAME: "Receivables A {GROUP_ID} {REQUEST_ID}"
     " LEFT JOIN ("
     "   SELECT"
     "     gjb.NAME AS GL_BATCH_NAME,"
@@ -158,6 +204,9 @@ MAIN_QUERY = (
 )
 
 
+# ==========================
+# ORACLE HELPERS
+# ==========================
 def initialize_oracle_client():
     try:
         oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
@@ -198,6 +247,9 @@ def fetch_query(conn, sql, params):
     return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=cols)
 
 
+# ==========================
+# MAIN
+# ==========================
 def main():
     logger.info("=" * 60)
     logger.info("Brazil GL Subledger Export - v6 FINAL")
@@ -205,7 +257,7 @@ def main():
     logger.info(f"  Period  : {PERIOD_NAME}")
     logger.info(f"  Company : {COMPANY}")
     logger.info(f"  Accounts: {ACCOUNTS}")
-    logger.info("  Strategy: XLA base + GL context subquery (no cartesian)")
+    logger.info("  Output  : " + str(OUTPUT_FILE))
     logger.info("=" * 60)
 
     initialize_oracle_client()
@@ -219,7 +271,7 @@ def main():
     }
 
     try:
-        logger.info("Executing main query...")
+        logger.info("Executing query...")
         df = fetch_query(conn, MAIN_QUERY, params)
         logger.info(f"  Rows fetched: {len(df):,}")
         logger.info("  Category breakdown:")
@@ -235,17 +287,17 @@ def main():
             logger.info("Connection closed")
 
     if df.empty:
-        logger.warning("No data returned.")
+        logger.warning("No data returned. Check PERIOD_NAME, LEDGER_NAME, COMPANY.")
         sys.exit(0)
 
-    # Fix LEDGER_NAME
+    # Fix LEDGER_NAME (query returns SEGMENT1, replace with actual ledger name)
     df["LEDGER_NAME"] = LEDGER_NAME
 
-    # Save CSV
+    # Save as CSV (UTF-8 BOM for Excel compatibility)
     df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
     logger.info(f"  Saved: {OUTPUT_FILE}")
 
-    # Validation
+    # Validation summary
     logger.info("=" * 60)
     logger.info("VALIDATION BY ACCOUNT")
     for acct in ACCOUNTS:
@@ -265,7 +317,8 @@ def main():
             f"GL_Date={gd_ok:,}/{len(sub):,}"
         )
     logger.info("=" * 60)
-    logger.info(f"DONE: {OUTPUT_FILE}")
+    logger.info("DONE")
+    logger.info(f"File: {OUTPUT_FILE}")
     logger.info("=" * 60)
 
 
