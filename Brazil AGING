@@ -1,93 +1,167 @@
 """
-Brazil GL with Subledger Detail - Export Script
-================================================
-Replica o report "EXPD GL with Subledger Detail" do OBI para Oracle EBS.
+Brazil MXM Closing Workbook Builder — FULL INTEGRATED VERSION
+==============================================================
+Executes all Oracle queries, populates tabs, and generates the closing workbook.
 
-ESTRATEGIA:
-  - Base: XLA_AE_LINES (1 linha por transacao, sem cartesiano)
-  - GL context (GL_DATE, Batch Name etc): subquery agregada por GROUP_ID + JE_CATEGORY
-  - Party Name: SOURCE_ID_INT_1 -> AR_CASH_RECEIPTS_ALL -> HZ_CUST_ACCOUNTS -> HZ_PARTIES
-  - GROUP_ID extraido do BATCH_NAME: "Receivables A {GROUP_ID} {REQUEST_ID}"
+USAGE (on your machine):
+    python build_brazil_closing.py
 
-SCHEMAS UTILIZADOS:
-  - XLA  : XLA_AE_HEADERS, XLA_AE_LINES, XLA_TRANSACTION_ENTITIES, XLA_EVENT_TYPES_B
-  - GL   : GL_JE_HEADERS, GL_JE_LINES, GL_JE_BATCHES, GL_LEDGERS, GL_CODE_COMBINATIONS
-  - AR   : AR_CASH_RECEIPTS_ALL, HZ_CUST_ACCOUNTS, HZ_PARTIES
-  - APPLSYS: FND_USER
+PARAMETERS — update only the CONFIG block below.
 
-VALIDADO CONTRA:
-  - OBI report "EXPD GL with Subledger Detail" (JUL-26, Company 11115, Accounts 113001/113100)
-  - MXM Closing report Brazil JUL-26
-  - Net 113001: -80,047.76 | Linhas: 25,770 | Execucao: ~20 segundos
+SHEETS GENERATED:
+    Summary                    HC vs GL comparison + MXM Trial Balance + SP Gov patterns
+    GL with Subledger Detail   GL Subledger query output (accounts 113001 + 113100)
+    Brazil Adjustment          Brazil ADJ query output
+    Brazil Transactions        BR Trans from period query output (CM+DM+INV)
+    Aging List Updated         AR Aging 7 Buckets query output
+    SP GovUpdated              Empty tab — manual input from SP Government portal
+    Rebilled Inv               Auto: REBILL-OWNERSHIP CHANGE CMs + credited INVs + substitutes
 
-PARAMETROS (alterar no topo do arquivo):
-  LEDGER_NAME  : nome do ledger (ex: "Brazil PL")
-  PERIOD_NAME  : periodo Oracle (ex: "AUG-26", "SEP-26")
-  COMPANY      : segmento 1 do COA (ex: "11115")
-  ACCOUNTS     : tuple de contas segmento 2 (ex: ("113001", "113100"))
-
-OUTPUT:
-  CSV em ~/Downloads/Brazil_GL_Subledger_{PERIOD}_{DATE}.csv
-  Encoding UTF-8 BOM (compativel com Excel)
-
-Author : Jose Santos (josenjr@expediagroup.com)
-Created: 2026-08-18
+Author: José Santos (josenjr@expediagroup.com)
 """
 
 import os
+import re
 import sys
 import logging
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
+from collections import defaultdict
 
 import oracledb
 import pandas as pd
+import openpyxl
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-# ==========================
+# ============================================================
 # LOGGING
-# ==========================
+# ============================================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# ==========================
+# ============================================================
+# CONFIG  <<<  UPDATE HERE FOR EACH PERIOD
+# ============================================================
+PERIOD_NAME   = "JUL-26"               # Oracle period string
+PERIOD_LABEL  = "July 2026"            # Human-readable label for Summary
+PERIOD_YEAR   = 2026                   # Numeric year
+PERIOD_MONTH  = 7                      # Numeric month (1-12)
+
+# Oracle date filters — derived automatically from month/year
+import calendar
+_last_day = calendar.monthrange(PERIOD_YEAR, PERIOD_MONTH)[1]
+_months_pt = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
+_mon = _months_pt[PERIOD_MONTH - 1]
+
+PERIOD_START_ORACLE  = f"01-{_mon}-{str(PERIOD_YEAR)[2:]}"   # e.g. "01-JUL-26"
+PERIOD_END_ORACLE    = f"{_last_day:02d}-{_mon}-{str(PERIOD_YEAR)[2:]}"  # e.g. "31-JUL-26"
+PERIOD_START_4Y      = f"01-{_mon}-{PERIOD_YEAR}"            # e.g. "01-JUL-2026"
+PERIOD_END_4Y        = f"{_last_day:02d}-{_mon}-{PERIOD_YEAR}"
+AS_OF_DATE           = f"{PERIOD_YEAR}-{PERIOD_MONTH:02d}-{_last_day:02d}"  # e.g. "2026-07-31"
+
+# ============================================================
 # ORACLE CONFIG
-# ==========================
+# ============================================================
 ORACLE_CLIENT_DIR = r"C:\Users\josenjr\OneDrive - Expedia Group\Desktop\Oracle Instant Client\instantclient_23_0"
-USERNAME = os.getenv("ORACLE_USER",     "XXXXX")
-PASSWORD = os.getenv("ORACLE_PASSWORD", "XXXXXXX")
-DSN      = os.getenv("ORACLE_DSN",      "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI")
+USERNAME  = os.getenv("ORACLE_USER",     "josenjr")
+PASSWORD  = os.getenv("ORACLE_PASSWORD", "RzTjfSBwn07")
+DSN       = os.getenv("ORACLE_DSN",      "ashworaebsdb02-vip.datawarehouse.expecn.com:1526/ORAPRD_UI")
+AR_APP_ID = 222
+LEDGER    = "Brazil PL"
+COMPANY   = "11115"
 
-# ==========================
-# PARAMETROS  <<< MUDE AQUI
-# ==========================
-LEDGER_NAME = "Brazil PL"
-PERIOD_NAME = "JUL-26"
-COMPANY     = "11115"
-ACCOUNTS    = ("113001", "113100")
-AR_APP_ID   = 222          # Application ID do AR no Oracle EBS - nao alterar
-
-# ==========================
+# ============================================================
 # OUTPUT
-# ==========================
+# ============================================================
 DOWNLOADS_DIR = Path(os.path.expanduser("~")) / "Downloads"
 today_str     = date.today().strftime("%Y%m%d")
-OUTPUT_FILE   = DOWNLOADS_DIR / (
-    "Brazil_GL_Subledger_"
-    + PERIOD_NAME.replace("-", "_")
-    + "_" + today_str + ".csv"
-)
+OUTPUT_FILE   = DOWNLOADS_DIR / f"Brazil_MXM_Closing_{PERIOD_NAME.replace('-','_')}_{today_str}.xlsx"
 
-# ==========================
-# QUERY PRINCIPAL
-# ==========================
-MAIN_QUERY = (
+# ============================================================
+# STYLES
+# ============================================================
+FONT_NAME = "Arial"
+C_DARK    = "1F3864"
+C_MID     = "2E75B6"
+C_LIGHT   = "D6E4F7"
+C_YELLOW  = "FFFF00"
+C_GREEN   = "E2EFDA"
+C_GREY    = "F2F2F2"
+C_RED     = "FF0000"
+C_WHITE   = "FFFFFF"
+C_CM      = "FCE4D6"
+C_INV     = "EBF3FB"
+C_REBILL  = "E2EFDA"
+
+NUM_BRL     = '#,##0.00'
+NUM_BRL_NEG = '#,##0.00;[RED]-#,##0.00'
+
+def fill(c): return PatternFill("solid", fgColor=c)
+def font(bold=False, color="000000", size=10, italic=False):
+    return Font(name=FONT_NAME, bold=bold, color=color, size=size, italic=italic)
+def border(s="thin"):
+    sd = Side(style=s)
+    return Border(left=sd, right=sd, top=sd, bottom=sd)
+def hdr(cell, bg=C_DARK, fg=C_WHITE, bold=True, size=10, center=True):
+    cell.fill = fill(bg); cell.font = font(bold=bold, color=fg, size=size)
+    cell.border = border()
+    cell.alignment = Alignment(
+        horizontal="center" if center else "left", vertical="center", wrap_text=True)
+def amt(cell, value, neg_red=True):
+    cell.value = value
+    cell.number_format = NUM_BRL_NEG if neg_red else NUM_BRL
+    cell.font = font(color=C_RED if (neg_red and value and value < 0) else "000000")
+    cell.alignment = Alignment(horizontal="right", vertical="center")
+    cell.border = border("hair")
+
+# ============================================================
+# ORACLE CONNECTION
+# ============================================================
+def init_oracle():
+    try:
+        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
+        log.info("Oracle client initialized")
+    except Exception as e:
+        log.error(f"Oracle client init failed: {e}"); raise
+
+def get_conn(retries=3):
+    for i in range(1, retries + 1):
+        try:
+            log.info(f"Connecting to Oracle (attempt {i}/{retries})...")
+            conn = oracledb.connect(user=USERNAME, password=PASSWORD, dsn=DSN)
+            with conn.cursor() as cur:
+                cur.execute("ALTER SESSION SET CURRENT_SCHEMA = APPS")
+            log.info("Connected.")
+            return conn
+        except oracledb.DatabaseError as e:
+            if i == retries: raise
+            log.warning(f"Attempt {i} failed, retrying...")
+
+def run_query(conn, sql, params=None, chunk=5000):
+    chunks = []
+    with conn.cursor() as cur:
+        cur.arraysize = chunk
+        cur.execute(sql, params or {})
+        cols = [d[0].upper() for d in cur.description]
+        while True:
+            rows = cur.fetchmany(chunk)
+            if not rows: break
+            chunks.append(pd.DataFrame(rows, columns=cols))
+    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=cols)
+
+# ============================================================
+# QUERIES
+# ============================================================
+
+# ── 1. GL with Subledger Detail ──────────────────────────────
+SQL_GL = (
     "SELECT"
-
-    # COA (via GL_CODE_COMBINATIONS)
     " gcc.SEGMENT1                                        AS LEDGER_NAME,"
     " gcc.SEGMENT1                                        AS COMPANY,"
     " gcc.SEGMENT2                                        AS ACCOUNT,"
@@ -97,13 +171,9 @@ MAIN_QUERY = (
     " gcc.SEGMENT6                                        AS PROJECT,"
     " gcc.SEGMENT7                                        AS PRODUCT,"
     " gcc.SEGMENT8                                        AS INTERCO,"
-
-    # Periodo
     " TO_NUMBER(TO_CHAR(xh.ACCOUNTING_DATE,'YYYY'))       AS PERIOD_YEAR,"
     " TO_NUMBER(TO_CHAR(xh.ACCOUNTING_DATE,'MM'))         AS PERIOD_NUMBER,"
     " xh.PERIOD_NAME,"
-
-    # GL context (via subquery)
     " glc.GL_DATE,"
     " glc.GL_BATCH_NAME,"
     " glc.POSTED_DATE,"
@@ -111,26 +181,18 @@ MAIN_QUERY = (
     " glc.JE_SOURCE_NAME,"
     " xh.JE_CATEGORY_NAME                                AS JOURNAL_CATEGORY,"
     " glc.HEADER_DESCRIPTION,"
-
-    # Subledger
     " xet.EVENT_CLASS_CODE                               AS EVENT_CLASS_NAME,"
     " hp.PARTY_NUMBER,"
     " hp.PARTY_NAME,"
     " xte.TRANSACTION_NUMBER,"
     " xh.ACCOUNTING_DATE                                 AS TRANSACTION_DATE,"
-
-    # Linha XLA
     " xl.AE_LINE_NUM                                     AS GL_LINE_NUMBER,"
     " xl.DESCRIPTION                                     AS GL_LINE_DESCRIPTION,"
     " glc.CREATED_BY,"
-
-    # Conversao
     " glc.CONVERSION_RATE,"
     " glc.CONVERSION_RATE_DATE,"
     " glc.CONVERSION_RATE_TYPE,"
     " glc.ENTERED_CURRENCY,"
-
-    # Valores (perspectiva da conta contabil via XLA)
     " NVL(xl.ENTERED_DR, 0)                              AS ENTERED_DEBIT,"
     " NVL(xl.ENTERED_CR, 0)                              AS ENTERED_CREDIT,"
     " NVL(xl.ENTERED_DR, 0) - NVL(xl.ENTERED_CR, 0)     AS ENTERED_AMT,"
@@ -138,36 +200,20 @@ MAIN_QUERY = (
     " NVL(xl.ACCOUNTED_DR, 0)                            AS ACCOUNTED_DEBIT,"
     " NVL(xl.ACCOUNTED_CR, 0)                            AS ACCOUNTED_CREDIT,"
     " NVL(xl.ACCOUNTED_DR, 0) - NVL(xl.ACCOUNTED_CR, 0) AS ACCTD_AMT"
-
     " FROM XLA.XLA_AE_HEADERS xh"
     " JOIN XLA.XLA_AE_LINES xl"
-    "   ON xl.AE_HEADER_ID = xh.AE_HEADER_ID"
-    "  AND xl.APPLICATION_ID = :ar_app_id"
+    "   ON xl.AE_HEADER_ID = xh.AE_HEADER_ID AND xl.APPLICATION_ID = :ar_app_id"
     " JOIN XLA.XLA_TRANSACTION_ENTITIES xte"
-    "   ON xte.ENTITY_ID = xh.ENTITY_ID"
-    "  AND xte.APPLICATION_ID = :ar_app_id"
+    "   ON xte.ENTITY_ID = xh.ENTITY_ID AND xte.APPLICATION_ID = :ar_app_id"
     " LEFT JOIN XLA.XLA_EVENT_TYPES_B xet"
-    "   ON xet.EVENT_TYPE_CODE = xh.EVENT_TYPE_CODE"
-    "  AND xet.APPLICATION_ID = :ar_app_id"
-
-    # Party: SOURCE_ID_INT_1 = CASH_RECEIPT_ID (confirmado para AR Receipts)
-    " LEFT JOIN AR.AR_CASH_RECEIPTS_ALL acr"
-    "   ON acr.CASH_RECEIPT_ID = xte.SOURCE_ID_INT_1"
-    " LEFT JOIN AR.HZ_CUST_ACCOUNTS hca"
-    "   ON hca.CUST_ACCOUNT_ID = acr.PAY_FROM_CUSTOMER"
-    " LEFT JOIN AR.HZ_PARTIES hp"
-    "   ON hp.PARTY_ID = hca.PARTY_ID"
-
-    # Filtro por segmento
-    " JOIN GL.GL_CODE_COMBINATIONS gcc"
-    "   ON gcc.CODE_COMBINATION_ID = xl.CODE_COMBINATION_ID"
-
-    # GL context: 1 linha por GROUP_ID + JE_CATEGORY (sem cartesiano)
-    # GROUP_ID = 1o numero do BATCH_NAME: "Receivables A {GROUP_ID} {REQUEST_ID}"
+    "   ON xet.EVENT_TYPE_CODE = xh.EVENT_TYPE_CODE AND xet.APPLICATION_ID = :ar_app_id"
+    " LEFT JOIN AR.AR_CASH_RECEIPTS_ALL acr ON acr.CASH_RECEIPT_ID = xte.SOURCE_ID_INT_1"
+    " LEFT JOIN AR.HZ_CUST_ACCOUNTS hca ON hca.CUST_ACCOUNT_ID = acr.PAY_FROM_CUSTOMER"
+    " LEFT JOIN AR.HZ_PARTIES hp ON hp.PARTY_ID = hca.PARTY_ID"
+    " JOIN GL.GL_CODE_COMBINATIONS gcc ON gcc.CODE_COMBINATION_ID = xl.CODE_COMBINATION_ID"
     " LEFT JOIN ("
-    "   SELECT"
-    "     gjb.NAME AS GL_BATCH_NAME,"
-    "     TO_NUMBER(REGEXP_SUBSTR(gjb.NAME, '[0-9]+', 1, 1)) AS GL_GROUP_ID,"
+    "   SELECT gjb.NAME AS GL_BATCH_NAME,"
+    "     TO_NUMBER(REGEXP_SUBSTR(gjb.NAME,'[0-9]+',1,1)) AS GL_GROUP_ID,"
     "     CASE gjh.JE_CATEGORY WHEN 'Adjustments' THEN 'Adjustment' ELSE gjh.JE_CATEGORY END AS JE_CATEGORY,"
     "     MIN(gjh.DEFAULT_EFFECTIVE_DATE) AS GL_DATE,"
     "     MIN(gjh.POSTED_DATE)            AS POSTED_DATE,"
@@ -182,144 +228,1084 @@ MAIN_QUERY = (
     "   FROM GL.GL_JE_HEADERS gjh"
     "   JOIN GL.GL_JE_BATCHES gjb ON gjb.JE_BATCH_ID = gjh.JE_BATCH_ID"
     "   LEFT JOIN APPLSYS.FND_USER fu ON fu.USER_ID = gjh.CREATED_BY"
-    "   WHERE gjh.STATUS = 'P'"
-    "   AND gjh.ACTUAL_FLAG = 'A'"
-    "   AND gjh.PERIOD_NAME = :period_name"
-    "   AND gjh.JE_SOURCE = 'Receivables'"
-    "   AND gjh.CURRENCY_CODE <> 'STAT'"
-    "   AND gjh.LEDGER_ID = (SELECT LEDGER_ID FROM GL.GL_LEDGERS WHERE NAME = :ledger_name)"
-    "   GROUP BY gjb.NAME, TO_NUMBER(REGEXP_SUBSTR(gjb.NAME, '[0-9]+', 1, 1)), CASE gjh.JE_CATEGORY WHEN 'Adjustments' THEN 'Adjustment' ELSE gjh.JE_CATEGORY END"
-    " ) glc"
-    "   ON glc.GL_GROUP_ID = xh.GROUP_ID"
-    "  AND glc.JE_CATEGORY = xh.JE_CATEGORY_NAME"
-
-    " WHERE xh.APPLICATION_ID = :ar_app_id"
-    " AND xh.LEDGER_ID = (SELECT LEDGER_ID FROM GL.GL_LEDGERS WHERE NAME = :ledger_name)"
-    " AND xh.PERIOD_NAME = :period_name"
-    " AND xh.JE_CATEGORY_NAME IN ('Receipts','Adjustment','Adjustments','Credit Memos','Debit Memos','Trade Receipts','Sales Invoices','Miscellaneous Receipts')"
-    " AND gcc.SEGMENT1 = :company"
+    "   WHERE gjh.STATUS='P' AND gjh.ACTUAL_FLAG='A' AND gjh.PERIOD_NAME=:period_name"
+    "   AND gjh.JE_SOURCE='Receivables' AND gjh.CURRENCY_CODE<>'STAT'"
+    "   AND gjh.LEDGER_ID=(SELECT LEDGER_ID FROM GL.GL_LEDGERS WHERE NAME=:ledger_name)"
+    "   GROUP BY gjb.NAME,"
+    "     TO_NUMBER(REGEXP_SUBSTR(gjb.NAME,'[0-9]+',1,1)),"
+    "     CASE gjh.JE_CATEGORY WHEN 'Adjustments' THEN 'Adjustment' ELSE gjh.JE_CATEGORY END"
+    " ) glc ON glc.GL_GROUP_ID=xh.GROUP_ID AND glc.JE_CATEGORY=xh.JE_CATEGORY_NAME"
+    " WHERE xh.APPLICATION_ID=:ar_app_id"
+    " AND xh.LEDGER_ID=(SELECT LEDGER_ID FROM GL.GL_LEDGERS WHERE NAME=:ledger_name)"
+    " AND xh.PERIOD_NAME=:period_name"
+    " AND xh.JE_CATEGORY_NAME IN ('Receipts','Adjustment','Adjustments','Credit Memos',"
+    "   'Debit Memos','Trade Receipts','Sales Invoices','Miscellaneous Receipts')"
+    " AND gcc.SEGMENT1=:company"
     " AND gcc.SEGMENT2 IN ('113001','113100')"
-
     " ORDER BY xh.ACCOUNTING_DATE, glc.GL_BATCH_NAME, xl.AE_LINE_NUM"
 )
 
+# ── 2. Brazil Transactions from Period ───────────────────────
+SQL_TRANS = """
+SELECT
+    GLL.LEDGER_NAME                                         "Ledger",
+    HOU.NAME                                                "OU NAME",
+    SUBSTR(HOU.NAME,6,51)                                   "Legal Entity",
+    SUBSTR(HOU.NAME,1,5)                                    "Company",
+    PSA.INVOICE_CURRENCY_CODE                               "Currency",
+    PSA.CLASS                                               "CLASS",
+    CTA.TRX_NUMBER                                          "Transaction Number",
+    CTTA.NAME                                               "TRX Type Name",
+    HZP.PARTY_NAME                                          "Customer Name",
+    HCA.ACCOUNT_NUMBER                                      "Account Number",
+    CTA.CONTRACT_ID                                         "Contract No.",
+    TO_CHAR(CTA.TRX_DATE,'MMDDYYYY')                        "TRX DATE",
+    TO_CHAR(PSA.GL_DATE,'MMDDYYYY')                         "GL Date",
+    PSA.AMOUNT_DUE_ORIGINAL                                 "Entered Amt",
+    CASE
+        WHEN SUBSTR(CTTA.NAME,1,2) IN ('CH','US')
+        THEN ROUND(CTA.EXCHANGE_RATE * PSA.AMOUNT_DUE_ORIGINAL,2)
+        ELSE PSA.AMOUNT_DUE_ORIGINAL
+    END                                                     "Functional Amt",
+    CASE
+        WHEN PSA.INVOICE_CURRENCY_CODE = 'USD' THEN 1
+        ELSE ROUND(GLDR.CONVERSION_RATE,6)
+    END                                                     "Conversion Rate",
+    CASE
+        WHEN PSA.INVOICE_CURRENCY_CODE = 'USD' THEN PSA.AMOUNT_DUE_ORIGINAL
+        ELSE ROUND(ROUND(GLDR.CONVERSION_RATE,2) * PSA.AMOUNT_DUE_ORIGINAL,11)
+    END                                                     "USD Amount",
+    TO_CHAR(CTA.PRINTING_LAST_PRINTED,'MM/DD/YYYY HH:MI')  "Invoice Print Date",
+    CTA.INTERFACE_HEADER_ATTRIBUTE1                         "Reference",
+    CTA.COMMENTS                                            "Comments",
+    CTA.REASON_CODE                                         "Reason Code",
+    CTA.PRIMARY_SALESREP_ID                                 "Sales Manager",
+    ARM.NAME                                                "Receipt Method",
+    HZP.CITY                                                "City",
+    HZP.COUNTRY                                             "Country",
+    CASE WHEN PSA.AMOUNT_IN_DISPUTE IS NULL THEN 0
+         ELSE PSA.AMOUNT_IN_DISPUTE END                     "Amount In Dispute",
+    CASE WHEN PSA.DISPUTE_DATE IS NULL THEN NULL
+         ELSE PSA.DISPUTE_DATE END                          "Dispute Date",
+    HCA.ATTRIBUTE1                                          "Hotel ID",
+    TT.NAME                                                 "Term Name",
+    FNU.USER_NAME                                           "Created By User"
+FROM AR.RA_CUSTOMER_TRX_ALL CTA
+LEFT JOIN AR.HZ_CUST_ACCOUNTS HCA      ON CTA.BILL_TO_CUSTOMER_ID = HCA.CUST_ACCOUNT_ID
+LEFT JOIN AR.HZ_PARTIES HZP            ON HCA.PARTY_ID = HZP.PARTY_ID
+LEFT JOIN APPS.HR_OPERATING_UNITS HOU  ON HOU.ORGANIZATION_ID = CTA.ORG_ID
+LEFT JOIN APPS.GL_LEDGER_LE_V GLL      ON GLL.LEGAL_ENTITY_ID = HOU.DEFAULT_LEGAL_CONTEXT_ID
+LEFT JOIN AR.AR_PAYMENT_SCHEDULES_ALL PSA ON PSA.CUSTOMER_TRX_ID = CTA.CUSTOMER_TRX_ID
+LEFT JOIN AR.AR_RECEIPT_METHODS ARM    ON CTA.RECEIPT_METHOD_ID = ARM.RECEIPT_METHOD_ID
+LEFT JOIN AR.RA_CUST_TRX_TYPES_ALL CTTA ON CTTA.CUST_TRX_TYPE_ID = CTA.CUST_TRX_TYPE_ID
+LEFT JOIN APPS.AR_CUSTOMER_PROFILES_V CPV ON HCA.CUST_ACCOUNT_ID = CPV.CUSTOMER_ID
+LEFT JOIN APPS.FND_USER FNU            ON FNU.USER_ID = CTA.CREATED_BY
+LEFT JOIN (
+    SELECT SUM(EXTENDED_AMOUNT) TAX_AMOUNT, CUSTOMER_TRX_ID, LINE_TYPE
+    FROM AR.RA_CUSTOMER_TRX_LINES_ALL
+    WHERE LINE_TYPE = 'TAX'
+    GROUP BY CUSTOMER_TRX_ID, LINE_TYPE
+) CTLA ON CTA.CUSTOMER_TRX_ID = CTLA.CUSTOMER_TRX_ID
+LEFT JOIN (
+    SELECT CONVERSION_RATE, FROM_CURRENCY, TO_CURRENCY, CONVERSION_DATE
+    FROM GL.GL_DAILY_RATES
+    WHERE TO_CURRENCY = 'USD' AND CONVERSION_TYPE = 'Corporate'
+) GLDR ON GLDR.FROM_CURRENCY = PSA.INVOICE_CURRENCY_CODE
+      AND GLDR.CONVERSION_DATE = PSA.GL_DATE
+LEFT JOIN AR.RA_TERMS_TL TT ON PSA.TERM_ID = TT.TERM_ID
+WHERE GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
+  AND CTTA.NAME NOT LIKE '%EAC%'
+  AND GLL.LEDGER_NAME IN ('Brazil PL')
+  AND PSA.GL_DATE BETWEEN :period_start AND :period_end
+  AND PSA.CLASS IN ('CM','DM','INV')
+"""
 
-# ==========================
-# ORACLE HELPERS
-# ==========================
-def initialize_oracle_client():
-    try:
-        oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_DIR)
-        logger.info("Oracle client initialized")
-    except Exception as e:
-        logger.error(f"Oracle client init failed: {e}")
-        raise
+# ── 3. Brazil Adjustments ────────────────────────────────────
+SQL_ADJ = """
+SELECT DISTINCT
+    GLL.LEDGER_NAME                         "Ledger",
+    HZP.COUNTRY                             "Country",
+    CTA.ATTRIBUTE_CATEGORY                  "Attribute Category",
+    HOU.NAME                                "Operating Unit",
+    SUBSTR(HOU.NAME,1,5)                    "Company",
+    AAA.ADJUSTMENT_NUMBER                   "Adjustment Number",
+    RTA.NAME                                "NAME",
+    AAA.GL_DATE                             "Adjustment GL Date",
+    AAA.STATUS                              "Approval Status",
+    AAA.REASON_CODE                         "Reason Code",
+    AAA.COMMENTS                            "Comments",
+    CTA.TRX_NUMBER                          "Transaction Number",
+    CTTA.NAME                               "TRX Type Name",
+    AAA.TYPE                                "TYPE",
+    PSA.GL_DATE                             "ADJUSTMENT TRX GL DATE",
+    PSA.DUE_DATE                            "Adjusted Trx Due Date",
+    HZP.PARTY_NAME                          "Customer Name",
+    HCA.ACCOUNT_NUMBER                      "Account Number",
+    FNU2.USER_NAME                          "Created By User",
+    FNU.USER_NAME                           "Approved By",
+    PSA.INVOICE_CURRENCY_CODE               "Entered Currency",
+    AAA.AMOUNT                              "Entered Amount",
+    CASE WHEN PSA.INVOICE_CURRENCY_CODE = 'USD' THEN 1
+         ELSE ROUND(GLDR.CONVERSION_RATE,13) END   "Conversion Rate",
+    CASE WHEN PSA.INVOICE_CURRENCY_CODE = 'USD' THEN AAA.AMOUNT
+         ELSE ROUND(ROUND(GLDR.CONVERSION_RATE,15) * AAA.AMOUNT,8) END "USD Amount"
+FROM AR_ADJUSTMENTS_ALL AAA
+LEFT JOIN AR.RA_CUSTOMER_TRX_ALL CTA         ON AAA.CUSTOMER_TRX_ID = CTA.CUSTOMER_TRX_ID
+LEFT JOIN AR.RA_CUSTOMER_TRX_LINES_ALL CTLA  ON CTA.CUSTOMER_TRX_ID = CTLA.CUSTOMER_TRX_ID
+LEFT JOIN AR.HZ_CUST_ACCOUNTS HCA            ON CTA.BILL_TO_CUSTOMER_ID = HCA.CUST_ACCOUNT_ID
+LEFT JOIN AR.HZ_PARTIES HZP                  ON HCA.PARTY_ID = HZP.PARTY_ID
+LEFT JOIN APPS.HR_OPERATING_UNITS HOU        ON HOU.ORGANIZATION_ID = CTA.ORG_ID
+LEFT JOIN APPS.GL_LEDGER_LE_V GLL            ON GLL.LEGAL_ENTITY_ID = HOU.DEFAULT_LEGAL_CONTEXT_ID
+LEFT JOIN AR.AR_PAYMENT_SCHEDULES_ALL PSA    ON PSA.CUSTOMER_TRX_ID = CTA.CUSTOMER_TRX_ID
+LEFT JOIN AR.AR_RECEIPT_METHODS ARM          ON CTA.RECEIPT_METHOD_ID = ARM.RECEIPT_METHOD_ID
+LEFT JOIN AR.RA_CUST_TRX_TYPES_ALL CTTA      ON CTTA.CUST_TRX_TYPE_ID = CTA.CUST_TRX_TYPE_ID
+LEFT JOIN APPS.AR_CUSTOMER_PROFILES_V CPV    ON HCA.CUST_ACCOUNT_ID = CPV.CUSTOMER_ID
+LEFT JOIN APPLSYS.FND_USER FNU               ON FNU.USER_ID = AAA.APPROVED_BY
+LEFT JOIN APPLSYS.FND_USER FNU2              ON FNU2.USER_ID = AAA.CREATED_BY
+LEFT JOIN AR.AR_RECEIVABLE_APPLICATIONS_ALL RAA ON RAA.APPLIED_CUSTOMER_TRX_ID = CTA.CUSTOMER_TRX_ID
+LEFT JOIN AR.AR_RECEIVABLES_TRX_ALL RTA      ON RTA.RECEIVABLES_TRX_ID = AAA.RECEIVABLES_TRX_ID
+LEFT JOIN (
+    SELECT CONVERSION_RATE, FROM_CURRENCY, TO_CURRENCY, CONVERSION_DATE
+    FROM GL.GL_DAILY_RATES
+    WHERE TO_CURRENCY = 'USD' AND CONVERSION_TYPE = 'Corporate'
+) GLDR ON GLDR.FROM_CURRENCY = PSA.INVOICE_CURRENCY_CODE
+      AND GLDR.CONVERSION_DATE = PSA.GL_DATE
+WHERE GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
+  AND CTTA.NAME NOT LIKE '%EAC%'
+  AND HOU.NAME LIKE '%11115%'
+  AND AAA.GL_DATE BETWEEN :adj_start AND :adj_end
+"""
+
+# ── 4. AR Aging 7 Buckets ────────────────────────────────────
+SQL_AGING = f"""
+WITH params AS (
+    SELECT
+        DATE '{AS_OF_DATE}'  AS as_of_date,
+        '{PERIOD_NAME}'      AS period_name,
+        'Brazil PL'          AS ledger_name,
+        222                  AS ar_app_id
+    FROM dual
+),
+ledger AS (
+    SELECT L.LEDGER_ID
+    FROM   GL.GL_LEDGERS L, params P
+    WHERE  L.NAME = P.ledger_name
+),
+fx_rate AS (
+    SELECT NVL(
+        (SELECT r.conversion_rate FROM gl.gl_daily_rates r, params P
+         WHERE r.from_currency='USD' AND r.to_currency='BRL'
+           AND r.conversion_type='Corporate'
+           AND r.conversion_date=TRUNC(P.as_of_date) AND ROWNUM=1),
+        (SELECT r.conversion_rate FROM gl.gl_daily_rates r, params P
+         WHERE r.from_currency='USD' AND r.to_currency='BRL'
+           AND r.conversion_type='Corporate'
+           AND r.conversion_date=(
+               SELECT MAX(r2.conversion_date) FROM gl.gl_daily_rates r2, params p2
+               WHERE r2.from_currency='USD' AND r2.to_currency='BRL'
+                 AND r2.conversion_type='Corporate'
+                 AND r2.conversion_date < TRUNC(p2.as_of_date))
+           AND ROWNUM=1)
+    ) AS usd_brl_rate
+    FROM dual
+),
+ar_inv_dm_cm AS (
+    SELECT 'Brazil PL' AS ledger, '11115' AS company,
+        GCC.SEGMENT2 AS account, HZP.PARTY_NAME AS customer,
+        HCA.ACCOUNT_NUMBER AS bill_to_number,
+        NVL(HCA.CUSTOMER_CLASS_CODE,'HOTEL') AS partner_category,
+        CTTA.NAME AS transaction_type,
+        CASE PSA.CLASS WHEN 'INV' THEN 'Invoice'
+            WHEN 'DM' THEN 'Debit Memo' WHEN 'CM' THEN 'Credit Memo'
+            ELSE PSA.CLASS END AS transaction_class,
+        CTA.TRX_NUMBER AS transaction_num,
+        CTA.TRX_DATE AS transaction_date,
+        NVL((SELECT T.TERRITORY_SHORT_NAME FROM APPS.FND_TERRITORIES_VL T
+             WHERE T.TERRITORY_CODE=HZP.COUNTRY AND ROWNUM=1), HZP.COUNTRY) AS bill_to_country,
+        PSA.DUE_DATE,
+        PSA.INVOICE_CURRENCY_CODE AS transactional_currency,
+        CASE WHEN PSA.STATUS='CL' THEN PSA.AMOUNT_DUE_ORIGINAL
+             ELSE PSA.AMOUNT_DUE_REMAINING END AS transactional_outstanding_amount,
+        GREATEST(TRUNC(P.AS_OF_DATE)-TRUNC(PSA.DUE_DATE),0) AS days_past_due,
+        NVL(PSA.ACCTD_AMOUNT_DUE_REMAINING,PSA.AMOUNT_DUE_ORIGINAL) AS outstanding_func,
+        HCA.ATTRIBUTE1 AS hotel_id,
+        DECODE(HCA.STATUS,'A','Active','I','Inactive',HCA.STATUS) AS account_status,
+        'No Sales Credit' AS salesperson,
+        P.AS_OF_DATE, FX.USD_BRL_RATE
+    FROM AR.RA_CUSTOMER_TRX_ALL CTA
+        JOIN params P ON 1=1 JOIN fx_rate FX ON 1=1 JOIN ledger L ON 1=1
+        JOIN AR.AR_PAYMENT_SCHEDULES_ALL PSA ON PSA.CUSTOMER_TRX_ID=CTA.CUSTOMER_TRX_ID
+        JOIN AR.RA_CUST_TRX_TYPES_ALL CTTA ON CTTA.CUST_TRX_TYPE_ID=CTA.CUST_TRX_TYPE_ID
+        LEFT JOIN AR.HZ_CUST_ACCOUNTS HCA ON HCA.CUST_ACCOUNT_ID=CTA.BILL_TO_CUSTOMER_ID
+        LEFT JOIN AR.HZ_PARTIES HZP ON HZP.PARTY_ID=HCA.PARTY_ID
+        LEFT JOIN (
+            SELECT RGL2.CUSTOMER_TRX_ID, MIN(GCC2.SEGMENT2) AS SEGMENT2
+            FROM AR.RA_CUST_TRX_LINE_GL_DIST_ALL RGL2
+            JOIN GL.GL_CODE_COMBINATIONS GCC2
+                ON GCC2.CODE_COMBINATION_ID=RGL2.CODE_COMBINATION_ID
+            WHERE RGL2.ACCOUNT_CLASS='REC' GROUP BY RGL2.CUSTOMER_TRX_ID
+        ) GCC ON GCC.CUSTOMER_TRX_ID=CTA.CUSTOMER_TRX_ID
+    WHERE CTA.ORG_ID=114
+      AND TRUNC(CTA.TRX_DATE) <= TRUNC(P.AS_OF_DATE)
+      AND CTTA.NAME LIKE 'BR\\_DIR\\_%' ESCAPE '\\'
+      AND PSA.CLASS IN ('INV','DM','CM')
+      AND ((PSA.STATUS='OP' AND PSA.AMOUNT_DUE_REMAINING<>0)
+           OR (PSA.STATUS='CL' AND PSA.AMOUNT_DUE_ORIGINAL<>0
+               AND TRUNC(PSA.LAST_UPDATE_DATE)>TRUNC(P.AS_OF_DATE)
+               AND TRUNC(PSA.LAST_UPDATE_DATE)<=TRUNC(SYSDATE)))
+      AND NOT (PSA.CLASS='CM' AND ABS(PSA.AMOUNT_DUE_REMAINING)<0.01
+               AND EXISTS (SELECT 1 FROM AR.AR_RECEIVABLE_APPLICATIONS_ALL APP
+                           WHERE APP.APPLIED_CUSTOMER_TRX_ID=CTA.CUSTOMER_TRX_ID
+                             AND APP.STATUS='APP' AND APP.DISPLAY='Y'))
+),
+ar_payments AS (
+    SELECT 'Brazil PL' AS ledger, '11115' AS company,
+        NULL AS account, HZP.PARTY_NAME AS customer,
+        HCA.ACCOUNT_NUMBER AS bill_to_number,
+        NVL(HCA.CUSTOMER_CLASS_CODE,'HOTEL') AS partner_category,
+        'Payment' AS transaction_type, 'Payment' AS transaction_class,
+        PSA.TRX_NUMBER AS transaction_num,
+        PSA.TRX_DATE AS transaction_date,
+        NVL((SELECT T.TERRITORY_SHORT_NAME FROM APPS.FND_TERRITORIES_VL T
+             WHERE T.TERRITORY_CODE=HZP.COUNTRY AND ROWNUM=1), HZP.COUNTRY) AS bill_to_country,
+        PSA.DUE_DATE, PSA.INVOICE_CURRENCY_CODE AS transactional_currency,
+        CASE WHEN PSA.STATUS='CL' THEN PSA.AMOUNT_DUE_ORIGINAL
+             ELSE PSA.AMOUNT_DUE_REMAINING END AS transactional_outstanding_amount,
+        GREATEST(TRUNC(P.AS_OF_DATE)-TRUNC(PSA.DUE_DATE),0) AS days_past_due,
+        NVL(PSA.ACCTD_AMOUNT_DUE_REMAINING,PSA.AMOUNT_DUE_ORIGINAL) AS outstanding_func,
+        HCA.ATTRIBUTE1 AS hotel_id,
+        DECODE(HCA.STATUS,'A','Active','I','Inactive',HCA.STATUS) AS account_status,
+        'No Sales Credit' AS salesperson,
+        P.AS_OF_DATE, FX.USD_BRL_RATE
+    FROM AR.AR_PAYMENT_SCHEDULES_ALL PSA
+        JOIN params P ON 1=1 JOIN fx_rate FX ON 1=1
+        LEFT JOIN AR.AR_CASH_RECEIPTS_ALL CR ON CR.CASH_RECEIPT_ID=PSA.CASH_RECEIPT_ID
+        LEFT JOIN AR.HZ_CUST_ACCOUNTS HCA ON HCA.CUST_ACCOUNT_ID=NVL(CR.PAY_FROM_CUSTOMER,PSA.CUSTOMER_ID)
+        LEFT JOIN AR.HZ_PARTIES HZP ON HZP.PARTY_ID=HCA.PARTY_ID
+    WHERE PSA.ORG_ID=114 AND PSA.CLASS='PMT'
+      AND TRUNC(PSA.TRX_DATE) <= TRUNC(P.AS_OF_DATE)
+      AND ((PSA.STATUS='OP' AND PSA.AMOUNT_DUE_REMAINING<>0)
+           OR (PSA.STATUS='CL' AND PSA.AMOUNT_DUE_ORIGINAL<>0
+               AND TRUNC(PSA.LAST_UPDATE_DATE)>TRUNC(P.AS_OF_DATE)
+               AND TRUNC(PSA.LAST_UPDATE_DATE)<=TRUNC(SYSDATE)))
+),
+ar_aging_raw AS (SELECT * FROM ar_inv_dm_cm UNION ALL SELECT * FROM ar_payments),
+ar_aged AS (
+    SELECT A.*,
+        CASE WHEN days_past_due=0 THEN 'Current'
+             WHEN days_past_due BETWEEN 1   AND 30  THEN '1-30 Days Past Due'
+             WHEN days_past_due BETWEEN 31  AND 60  THEN '31-60 Days Past Due'
+             WHEN days_past_due BETWEEN 61  AND 90  THEN '61-90 Days Past Due'
+             WHEN days_past_due BETWEEN 91  AND 180 THEN '91-180 Days Past Due'
+             WHEN days_past_due BETWEEN 181 AND 360 THEN '181-360 Days Past Due'
+             ELSE '361+ Days Past Due' END AS aging_category,
+        CASE WHEN days_past_due=0                 THEN transactional_outstanding_amount ELSE 0 END AS current_txn,
+        CASE WHEN days_past_due BETWEEN 1  AND 30  THEN transactional_outstanding_amount ELSE 0 END AS d1_30_txn,
+        CASE WHEN days_past_due BETWEEN 31 AND 60  THEN transactional_outstanding_amount ELSE 0 END AS d31_60_txn,
+        CASE WHEN days_past_due BETWEEN 61 AND 90  THEN transactional_outstanding_amount ELSE 0 END AS d61_90_txn,
+        CASE WHEN days_past_due BETWEEN 91 AND 180 THEN transactional_outstanding_amount ELSE 0 END AS d91_180_txn,
+        CASE WHEN days_past_due BETWEEN 181 AND 360 THEN transactional_outstanding_amount ELSE 0 END AS d181_360_txn,
+        CASE WHEN days_past_due > 360              THEN transactional_outstanding_amount ELSE 0 END AS d361plus_txn,
+        CASE WHEN days_past_due=0                 THEN outstanding_func ELSE 0 END AS current_func,
+        CASE WHEN days_past_due BETWEEN 1  AND 30  THEN outstanding_func ELSE 0 END AS d1_30_func,
+        CASE WHEN days_past_due BETWEEN 31 AND 60  THEN outstanding_func ELSE 0 END AS d31_60_func,
+        CASE WHEN days_past_due BETWEEN 61 AND 90  THEN outstanding_func ELSE 0 END AS d61_90_func,
+        CASE WHEN days_past_due BETWEEN 91 AND 180 THEN outstanding_func ELSE 0 END AS d91_180_func,
+        CASE WHEN days_past_due BETWEEN 181 AND 360 THEN outstanding_func ELSE 0 END AS d181_360_func,
+        CASE WHEN days_past_due > 360              THEN outstanding_func ELSE 0 END AS d361plus_func
+    FROM ar_aging_raw A
+)
+SELECT
+    A.ledger "Ledger", A.company "Company", A.account "Account",
+    A.customer "Customer", A.partner_category "Partner Category",
+    A.bill_to_number "Bill-To Number", A.hotel_id "Hotel ID",
+    NULL "Engagement Class", A.salesperson "Salesperson",
+    A.transaction_type "Transaction Type", A.transaction_class "Transaction Class",
+    A.transaction_num "Transaction #", A.transaction_date "Transaction Date",
+    A.bill_to_country "Bill To Country", A.due_date "Due Date",
+    A.transactional_currency "Transactional Currency",
+    ROUND(A.transactional_outstanding_amount,2) "Transactional Outstanding Amount",
+    A.aging_category "Aging Category",
+    ROUND(A.current_txn,2) "Current",
+    ROUND(A.d1_30_txn,2)   "1-30 Days Past Due",
+    ROUND(A.d31_60_txn,2)  "31-60 Days Past Due",
+    ROUND(A.d61_90_txn,2)  "61-90 Days Past Due",
+    ROUND(A.d91_180_txn,2) "91-180 Days Past Due",
+    ROUND(A.d181_360_txn,2) "181-360 Days Past Due",
+    ROUND(A.d361plus_txn,2) "361+ Days Past Due",
+    'BRL' "Functional Currency",
+    ROUND(A.outstanding_func,2)    "Outstanding Amount(Functional Currency)",
+    ROUND(A.current_func,2)        "Current(Functional Currency)",
+    ROUND(A.d1_30_func,2)          "1-30 Days Past Due(Functional Currency)",
+    ROUND(A.d31_60_func,2)         "31-60 Days Past Due(Functional Currency)",
+    ROUND(A.d61_90_func,2)         "61-90 Days Past Due(Functional Currency)",
+    ROUND(A.d91_180_func,2)        "91-180 Days Past Due(Functional Currency)",
+    ROUND(A.d181_360_func,2)       "181-360 Days Past Due(Functional Currency)",
+    ROUND(A.d361plus_func,2)       "361+ Days Past Due(Functional Currency)",
+    'USD' "Global Currency",
+    ROUND(A.outstanding_func/A.usd_brl_rate,2)    "Outstanding Amount( USD)",
+    ROUND(A.current_func/A.usd_brl_rate,2)        "Current(USD)",
+    ROUND(A.d1_30_func/A.usd_brl_rate,2)          "1-30 Days Past Due(USD)",
+    ROUND(A.d31_60_func/A.usd_brl_rate,2)         "31-60 Days Past Due(USD)",
+    ROUND(A.d61_90_func/A.usd_brl_rate,2)         "61-90 Days Past Due(USD)",
+    ROUND(A.d91_180_func/A.usd_brl_rate,2)        "91-180 Days Past Due(USD)",
+    ROUND(A.d181_360_func/A.usd_brl_rate,2)       "181-360 Days Past Due(USD)",
+    ROUND(A.d361plus_func/A.usd_brl_rate,2)       "361+ Days Past Due(USD)",
+    A.account_status "Account Status"
+FROM ar_aged A
+ORDER BY A.customer, A.transaction_date, A.transaction_num
+"""
+
+# ── 5. Transaction Register Detail (Credited + Rebilled INVs) ─
+# Adapted from Luke Whitely's Oracle Transaction Register - UAT
+# TRX numbers are injected dynamically at runtime via string format.
+# NOTE: oracledb does not support binding a list for IN clauses,
+# so we build the literal IN list safely from validated integers.
+SQL_TRX_DETAIL = """
+SELECT
+    CASE
+        WHEN HZP.COUNTRY IN ('AS','AU','BD','BN','BT','CC','CK','CN','FJ','FM','GU','HK',
+            'ID','IN','JP','KH','KP','KR','LA','LK','MH','MM','MN','MO','MP','MV','MY',
+            'NC','NF','NP','NU','NZ','PF','PG','PH','PK','PW','SB','SG','TH','TK','TL',
+            'TO','TW','VN','VU','WF','WS') THEN 'APAC'
+        WHEN HZP.COUNTRY IN ('AG','AI','AN','AR','AW','BB','BL','BM','BO','BQ','BR','BS',
+            'BZ','CL','CO','CR','CU','CW','DM','DO','EC','FK','GD','GF','GP','GT','GY',
+            'HN','HT','JM','KN','KY','LC','MF','MQ','MS','MX','NI','PA','PE','PN','PR',
+            'PY','SR','SV','SX','TC','TT','UY','VC','VE','VG','VI') THEN 'LATAM'
+        WHEN HZP.COUNTRY IN ('AL','AM','AT','AZ','BA','BE','BG','BY','CH','CZ','DE','DK',
+            'EE','FI','FO','FR','GB','GE','GG','GL','HR','HU','IE','IS','JE','KG','KZ',
+            'LI','LT','LU','LV','MD','ME','MK','NL','NO','PL','PM','RO','RS','RU','SE',
+            'SH','SI','SJ','SK','TJ','TM','UA','UZ') THEN 'N-EMEA'
+        WHEN HZP.COUNTRY IN ('AD','AE','AF','AO','BF','BH','BI','BJ','BV','BW','CD','CF',
+            'CG','CI','CM','CV','CY','DJ','DZ','EG','ER','ES','ET','GA','GH','GI','GM',
+            'GN','GQ','GR','GW','IL','IQ','IR','IT','JO','KE','KM','KW','LB','LR','LS',
+            'LY','MA','MC','MG','ML','MR','MT','MU','MW','MZ','NA','NE','NG','OM','PS',
+            'PT','QA','RE','RW','SA','SC','SD','SL','SM','SN','SS','ST','SY','SZ','TD',
+            'TG','TN','TR','TZ','UG','VA','YE','YT','ZA','ZM','ZW') THEN 'S-EMEA'
+        WHEN HZP.COUNTRY IN ('CA','US') THEN 'NAMER'
+        ELSE 'NOT_DEFINED'
+    END                                                     AS "POAR Super Region",
+    GLL.LEDGER_NAME                                         "Ledger",
+    HOU.NAME                                                "OU NAME",
+    SUBSTR(HOU.NAME,6,51)                                   "Legal Entity",
+    SUBSTR(HOU.NAME,1,5)                                    "Company",
+    PSA.INVOICE_CURRENCY_CODE                               "Currency",
+    PSA.CLASS                                               "CLASS",
+    CTA.ATTRIBUTE4                                          "XLR ID",
+    CTA.TRX_NUMBER                                          "Transaction Number",
+    CTTA.NAME                                               "TRX Type Name",
+    HZP.PARTY_NAME                                          "Customer Name",
+    HCA.ACCOUNT_NUMBER                                      "Account Number",
+    CTA.TRX_DATE                                            "TRX DATE",
+    PSA.GL_DATE                                             "GL Date",
+    TO_CHAR(CTA.TRX_DATE,'YYYY-MM')                         "Year / Month",
+    PSA.AMOUNT_DUE_ORIGINAL                                 "Entered Amt",
+    PSA.AMOUNT_DUE_REMAINING                                "Open Balance",
+    CASE
+        WHEN SUBSTR(CTTA.NAME,1,2) IN ('CH','US')
+        THEN ROUND(CTA.EXCHANGE_RATE * PSA.AMOUNT_DUE_ORIGINAL,2)
+        ELSE PSA.AMOUNT_DUE_ORIGINAL
+    END                                                     "Functional Amt",
+    CASE
+        WHEN PSA.INVOICE_CURRENCY_CODE = 'USD' THEN 1
+        ELSE ROUND(GLDR.CONVERSION_RATE,15)
+    END                                                     "Conversion Rate",
+    CASE
+        WHEN PSA.INVOICE_CURRENCY_CODE = 'USD' THEN PSA.AMOUNT_DUE_ORIGINAL
+        ELSE ROUND(ROUND(GLDR.CONVERSION_RATE,15) * PSA.AMOUNT_DUE_ORIGINAL,11)
+    END                                                     "USD Amount",
+    TO_CHAR(CTA.PRINTING_LAST_PRINTED,'MM/DD/YYYY HH:MI')  "Invoice Print Date",
+    CTA.INTERFACE_HEADER_ATTRIBUTE1                         "Reference",
+    CTA.COMMENTS                                            "Comments",
+    CTA.INTERFACE_HEADER_CONTEXT                            "Batch Name",
+    CTA.REASON_CODE                                         "Reason Code",
+    ARM.NAME                                                "Receipt Method",
+    HZP.CITY                                                "City",
+    HZP.COUNTRY                                             "Country",
+    ROUND(CTLA.TAX_AMOUNT,2)                                "Tax Amount",
+    CASE WHEN PSA.AMOUNT_IN_DISPUTE IS NULL THEN 0
+         ELSE PSA.AMOUNT_IN_DISPUTE END                     "Amount In Dispute",
+    CASE WHEN PSA.AMOUNT_IN_DISPUTE IS NULL
+              OR PSA.AMOUNT_IN_DISPUTE = 0 THEN 'NO'
+         ELSE 'YES' END                                     "TRX ON DISPUTE",
+    CASE WHEN PSA.DISPUTE_DATE IS NULL THEN NULL
+         ELSE PSA.DISPUTE_DATE END                          "Dispute Date",
+    HCA.ATTRIBUTE1                                          "Hotel ID",
+    TT.NAME                                                 "Term Name",
+    FNU.USER_NAME                                           "Created By User",
+    CASE
+        WHEN HCA.CUSTOMER_CLASS_CODE = 'TA' THEN 'Travel Ad'
+        WHEN HCA.CUSTOMER_CLASS_CODE = 'HOTEL'
+             AND CTTA.NAME NOT LIKE '%GROUP%' THEN 'Hotel Collect Independent'
+        WHEN HCA.CUSTOMER_CLASS_CODE = 'HOTEL'
+             AND CTTA.NAME LIKE '%GROUP%' THEN 'Hotel Collect Corporate'
+        WHEN HCA.CUSTOMER_CLASS_CODE = 'MESODB' THEN 'Meso Direct Bill'
+        WHEN HCA.CUSTOMER_CLASS_CODE IN ('SUPPLIER','OTHER')
+             OR CTTA.NAME LIKE '%SO' THEN 'Supplier Other'
+        WHEN HCA.CUSTOMER_CLASS_CODE = 'GROUP PARENT' THEN 'Hotel Collect Corporate'
+        WHEN HCA.CUSTOMER_CLASS_CODE = 'MESOMF' THEN 'Meso Marketing Funds'
+        WHEN HCA.CUSTOMER_CLASS_CODE = 'ELE' THEN 'Expedia Local Expert'
+        ELSE 'UNLABLED ITEM - PLEASE CONTACT ICORT'
+    END                                                     "Business Model",
+    CASE
+        WHEN CTTA.NAME LIKE '%RELO%'   THEN 'RELO'
+        WHEN CTTA.NAME LIKE '%VOIDED%' THEN 'VOIDED'
+        WHEN CTTA.NAME LIKE '%FRAUD%'  THEN 'FRAUD'
+        WHEN CTTA.NAME LIKE '%REBILL%' THEN 'REBILL'
+        ELSE 'Standard TRX'
+    END                                                     "TRX Type",
+    CASE
+        WHEN ARM.RECEIPT_METHOD_ID IN (
+            4004,56065,4009,4005,4003,4008,56066,39002,
+            4002,4006,4000,4011,56064,32000,37000,39003,
+            4010,72021,72020,72022) THEN 'AP'
+        ELSE 'Non AP'
+    END                                                     "AP Status"
+FROM AR.RA_CUSTOMER_TRX_ALL CTA
+LEFT JOIN AR.HZ_CUST_ACCOUNTS HCA      ON CTA.BILL_TO_CUSTOMER_ID = HCA.CUST_ACCOUNT_ID
+LEFT JOIN AR.HZ_PARTIES HZP            ON HCA.PARTY_ID = HZP.PARTY_ID
+LEFT JOIN APPS.HR_OPERATING_UNITS HOU  ON HOU.ORGANIZATION_ID = CTA.ORG_ID
+LEFT JOIN APPS.GL_LEDGER_LE_V GLL      ON GLL.LEGAL_ENTITY_ID = HOU.DEFAULT_LEGAL_CONTEXT_ID
+LEFT JOIN AR.AR_PAYMENT_SCHEDULES_ALL PSA ON PSA.CUSTOMER_TRX_ID = CTA.CUSTOMER_TRX_ID
+LEFT JOIN AR.AR_RECEIPT_METHODS ARM    ON CTA.RECEIPT_METHOD_ID = ARM.RECEIPT_METHOD_ID
+LEFT JOIN AR.RA_CUST_TRX_TYPES_ALL CTTA ON CTTA.CUST_TRX_TYPE_ID = CTA.CUST_TRX_TYPE_ID
+LEFT JOIN APPS.AR_CUSTOMER_PROFILES_V CPV ON HCA.CUST_ACCOUNT_ID = CPV.CUSTOMER_ID
+LEFT JOIN APPS.FND_USER FNU            ON FNU.USER_ID = CTA.CREATED_BY
+LEFT JOIN (
+    SELECT SUM(EXTENDED_AMOUNT) TAX_AMOUNT, CUSTOMER_TRX_ID, LINE_TYPE
+    FROM AR.RA_CUSTOMER_TRX_LINES_ALL
+    WHERE LINE_TYPE = 'TAX'
+    GROUP BY CUSTOMER_TRX_ID, LINE_TYPE
+) CTLA ON CTA.CUSTOMER_TRX_ID = CTLA.CUSTOMER_TRX_ID
+LEFT JOIN (
+    SELECT CONVERSION_RATE, FROM_CURRENCY, TO_CURRENCY, CONVERSION_DATE
+    FROM GL.GL_DAILY_RATES
+    WHERE TO_CURRENCY = 'USD' AND CONVERSION_TYPE = 'Corporate'
+) GLDR ON GLDR.FROM_CURRENCY = PSA.INVOICE_CURRENCY_CODE
+      AND GLDR.CONVERSION_DATE = PSA.GL_DATE
+LEFT JOIN AR.RA_TERMS_TL TT ON PSA.TERM_ID = TT.TERM_ID
+WHERE GLL.LEDGER_CATEGORY_CODE = 'PRIMARY'
+  AND CTTA.NAME NOT LIKE '%%EAC%%'
+  AND GLL.LEDGER_NAME = 'Brazil PL'
+  AND CTA.TRX_NUMBER IN ({trx_in})
+  AND PSA.PAYMENT_SCHEDULE_ID = (
+      SELECT MIN(PSA2.PAYMENT_SCHEDULE_ID)
+      FROM AR.AR_PAYMENT_SCHEDULES_ALL PSA2
+      WHERE PSA2.CUSTOMER_TRX_ID = CTA.CUSTOMER_TRX_ID
+  )
+"""
 
 
-def get_oracle_connection(max_retries=3):
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"Connecting to Oracle (attempt {attempt}/{max_retries})...")
-            conn = oracledb.connect(user=USERNAME, password=PASSWORD, dsn=DSN)
-            with conn.cursor() as cur:
-                cur.execute("ALTER SESSION SET CURRENT_SCHEMA = APPS")
-            logger.info("Connected successfully")
-            return conn
-        except oracledb.DatabaseError as e:
-            if attempt == max_retries:
-                raise
-            logger.warning(f"Attempt {attempt} failed, retrying...")
-    return None
+def run_trx_detail(conn, trx_numbers):
+    """
+    Run SQL_TRX_DETAIL for a set of transaction numbers.
+    CTA.TRX_NUMBER is VARCHAR2 in Oracle EBS — pass as quoted string literals.
+    Splits into batches of 999 to respect Oracle IN clause limit.
+    """
+    if not trx_numbers:
+        return pd.DataFrame()
+
+    # Validate: must be numeric strings only (no injection risk)
+    validated = [str(int(n)) for n in trx_numbers]
+    results = []
+
+    for i in range(0, len(validated), 999):
+        chunk   = validated[i:i + 999]
+        in_list = ",".join(f"'{v}'" for v in chunk)   # quoted strings for VARCHAR2
+        sql     = SQL_TRX_DETAIL.format(trx_in=in_list)
+        df      = run_query(conn, sql)
+        results.append(df)
+
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
 
 
-def fetch_query(conn, sql, params):
-    CHUNK = 5000
-    chunks = []
-    with conn.cursor() as cur:
-        cur.arraysize = CHUNK
-        cur.execute(sql, params)
-        cols = [d[0].upper() for d in cur.description]
-        while True:
-            batch = cur.fetchmany(CHUNK)
-            if not batch:
-                break
-            chunks.append(pd.DataFrame(batch, columns=cols))
-    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=cols)
+# ============================================================
+# WORKBOOK HELPERS
+# ============================================================
+def df_to_sheet(df, ws, header_bg=C_DARK, freeze=True):
+    """Write a DataFrame to a worksheet with formatted headers."""
+    if df.empty:
+        ws.append(list(df.columns))
+        return
+
+    # Headers
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        c = ws.cell(1, col_idx, col_name)
+        hdr(c, bg=header_bg, size=9)
+        # Auto-width estimate
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(
+            min(len(str(col_name)) + 4, 40), 10)
+
+    # Data
+    num_cols = df.select_dtypes(include='number').columns.tolist()
+    date_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
+
+    for row_idx, row in enumerate(df.itertuples(index=False), start=2):
+        for col_idx, (col_name, val) in enumerate(zip(df.columns, row), start=1):
+            c = ws.cell(row_idx, col_idx)
+            # Convert numpy types
+            if hasattr(val, 'item'):
+                val = val.item()
+            if pd.isna(val) if not isinstance(val, (str, datetime, date)) else False:
+                val = None
+            c.value = val
+            c.font = font(size=9)
+            c.border = border("hair")
+            c.alignment = Alignment(horizontal="left", vertical="center")
+            if col_name in num_cols and val is not None:
+                c.number_format = NUM_BRL_NEG
+                c.alignment = Alignment(horizontal="right", vertical="center")
+            if col_name in date_cols and val is not None:
+                c.number_format = "DD/MM/YYYY"
+
+    if freeze:
+        ws.freeze_panes = ws.cell(2, 1)
+    ws.sheet_view.showGridLines = False
 
 
-# ==========================
+# ============================================================
+# SUMMARY SHEET
+# ============================================================
+def write_summary(ws, df_trans, df_adj, df_gl):
+    ws.sheet_view.showGridLines = False
+    for col, w in [("A",18),("B",20),("C",4),("D",20),("E",20),
+                   ("F",4),("G",4),("H",40),("I",22),
+                   ("J",18),("K",14),("L",14),("M",14)]:
+        ws.column_dimensions[col].width = w
+
+    # Pivot HC
+    hc = df_trans.groupby("CLASS")["ENTERED AMT"].sum().to_dict() if not df_trans.empty else {}
+    # Pivot GL by Journal Category
+    gl = df_gl.groupby("JOURNAL_CATEGORY")["ENTERED_AMT"].sum().to_dict() if not df_gl.empty else {}
+    # Pivot ADJ by NAME
+    adj = df_adj.groupby("NAME")["ENTERED AMOUNT"].sum().to_dict() if not df_adj.empty else {}
+
+    # ── LEFT: EXPD HC ──────────────────────────────────────
+    r = 1
+    ws.merge_cells(f"A{r}:B{r}")
+    hdr(ws.cell(r, 1, "EXPD HC Transactions"), bg=C_DARK)
+    ws.cell(r, 2).fill = fill(C_DARK)
+    r += 1
+    hdr(ws.cell(r, 1, "Row Labels"), bg=C_MID, size=9)
+    hdr(ws.cell(r, 2, "Sum of Entered Amt"), bg=C_MID, size=9)
+    r += 1
+    hc_rows = [("CM", hc.get("CM", 0.0)), ("DM", hc.get("DM", 0.0)), ("INV", hc.get("INV", 0.0))]
+    for lbl, val in hc_rows:
+        ws.cell(r, 1, lbl).font = font(); ws.cell(r, 1).border = border("hair")
+        ws.cell(r, 1).fill = fill(C_GREY)
+        amt(ws.cell(r, 2), val); r += 1
+    ws.cell(r, 1, "Grand Total").font = font(bold=True)
+    ws.cell(r, 1).fill = fill(C_GREEN); ws.cell(r, 1).border = border()
+    c = ws.cell(r, 2, sum(v for _, v in hc_rows))
+    c.number_format = NUM_BRL; c.font = font(bold=True)
+    c.fill = fill(C_GREEN); c.border = border()
+    c.alignment = Alignment(horizontal="right")
+
+    # ── LEFT: Adjustment sub-table ─────────────────────────
+    r += 2
+    ws.merge_cells(f"A{r}:B{r}")
+    hdr(ws.cell(r, 1, "Adjustment"), bg=C_DARK)
+    ws.cell(r, 2).fill = fill(C_DARK)
+    r += 1
+    hdr(ws.cell(r, 1, "Row Labels"), bg=C_MID, size=9)
+    hdr(ws.cell(r, 2, "Sum of Entered Amount"), bg=C_MID, size=9)
+    r += 1
+    for name, val in sorted(adj.items()):
+        ws.cell(r, 1, name).font = font(); ws.cell(r, 1).border = border("hair")
+        ws.cell(r, 1).fill = fill(C_GREY)
+        amt(ws.cell(r, 2), val); r += 1
+    ws.cell(r, 1, "Grand Total").font = font(bold=True)
+    ws.cell(r, 1).fill = fill(C_GREEN); ws.cell(r, 1).border = border()
+    c = ws.cell(r, 2, sum(adj.values()) if adj else 0.0)
+    c.number_format = NUM_BRL; c.font = font(bold=True)
+    c.fill = fill(C_GREEN); c.border = border()
+    c.alignment = Alignment(horizontal="right")
+
+    # ── RIGHT: GL Subledger ────────────────────────────────
+    r2 = 1
+    ws.merge_cells(f"D{r2}:E{r2}")
+    hdr(ws.cell(r2, 4, "GL with Subledger details"), bg=C_DARK)
+    ws.cell(r2, 5).fill = fill(C_DARK)
+    r2 += 1
+    hdr(ws.cell(r2, 4, "Row Labels"), bg=C_MID, size=9)
+    hdr(ws.cell(r2, 5, "Sum of Entered Amt"), bg=C_MID, size=9)
+    r2 += 1
+    gl_rows = [
+        ("Adjustment",  gl.get("Adjustment", 0.0)),
+        ("Credit Memo", gl.get("Credit Memos", 0.0)),
+        ("Invoice",     gl.get("Sales Invoices", 0.0)),
+    ]
+    for lbl, val in gl_rows:
+        ws.cell(r2, 4, lbl).font = font(); ws.cell(r2, 4).border = border("hair")
+        ws.cell(r2, 4).fill = fill(C_GREY)
+        amt(ws.cell(r2, 5), val); r2 += 1
+    ws.cell(r2, 4, "Grand Total").font = font(bold=True)
+    ws.cell(r2, 4).fill = fill(C_GREEN); ws.cell(r2, 4).border = border()
+    c = ws.cell(r2, 5, sum(v for _, v in gl_rows))
+    c.number_format = NUM_BRL; c.font = font(bold=True)
+    c.fill = fill(C_GREEN); c.border = border()
+    c.alignment = Alignment(horizontal="right")
+
+    # ── RIGHT: MXM GL Trial Balance ────────────────────────
+    rm = 1
+    ws.merge_cells(f"H{rm}:M{rm}")
+    c = ws.cell(rm, 8, "MXM GL Trial Balance Summary")
+    c.fill = fill(C_YELLOW); c.font = font(bold=True, size=11)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    rm += 2
+    ws.merge_cells(f"H{rm}:M{rm}")
+    c = ws.cell(rm, 8, "0309 - EXPEDIA DO BRASIL AG DE VIAGENS E TUR LT")
+    c.font = font(bold=True); c.border = border()
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    rm += 1
+    ws.cell(rm, 8, f"Period: {PERIOD_LABEL}").font = font(bold=True, size=9)
+    ws.cell(rm, 10, "Trial Balance").font = font(bold=True, size=9)
+    ws.cell(rm, 11, "Date: [fill in]").font = font(italic=True, size=9, color="888888")
+    rm += 1
+    ws.cell(rm, 8, "Account: 3110101 to 3110101").font = font(size=9)
+    ws.cell(rm, 10, "Time: [fill in]").font = font(italic=True, size=9, color="888888")
+    rm += 1
+    ws.cell(rm, 8, "In local currency").font = font(bold=True, size=9)
+    rm += 1
+    for col, lbl in [(8,"Account"),(9,"Description"),(10,"Opening Balance"),(11,"Debit"),(12,"Credit"),(13,"Balance")]:
+        hdr(ws.cell(rm, col, lbl), bg=C_MID, size=9)
+    rm += 1
+    ws.cell(rm, 8, "3.1.1.01.01").font = font(size=9)
+    ws.cell(rm, 9, "REVENUE - HOTEL COMMISSION").font = font(size=9)
+    for col in [10, 11, 12, 13]:
+        c = ws.cell(rm, col, 0)
+        c.fill = fill(C_YELLOW); c.font = font(bold=True, size=9)
+        c.number_format = NUM_BRL
+        c.alignment = Alignment(horizontal="right"); c.border = border()
+    rm += 1
+    ws.cell(rm, 8, "← Fill in balances from MXM Trial Balance").font = font(italic=True, size=8, color="888888")
+
+    # ── RIGHT: SP Government Summary ──────────────────────
+    rm += 2
+    ws.merge_cells(f"H{rm}:M{rm}")
+    c = ws.cell(rm, 8, "SP Government Summary")
+    c.fill = fill(C_YELLOW); c.font = font(bold=True, size=11)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    rm += 2
+    ws.cell(rm, 9, "Totals").font = font(bold=True, size=9)
+    sp_fields = [
+        ("NFS-e Count:",                           True,  False),
+        ("Services Value:",                        True,  True),
+        ("Deductions Value:",                      False, False),
+        ("Credits Value:",                         False, False),
+        ("ISS due by service provider:",           False, False),
+        ("ISS payable by service provider:",       False, False),
+        ("ISS due by service taker:",              False, False),
+        ("ISS collectible by service taker:",      False, False),
+        ("ISS due by intermediary:",               False, False),
+        ("ISS collectible by intermediary:",       False, False),
+    ]
+    rm += 1
+    for lbl, bold, highlight in sp_fields:
+        ws.cell(rm, 8, lbl).font = font(bold=bold, size=9)
+        c = ws.cell(rm, 9, 0)
+        c.number_format = NUM_BRL; c.font = font(bold=bold, size=9)
+        c.alignment = Alignment(horizontal="right")
+        if highlight:
+            c.fill = fill(C_YELLOW); c.border = border()
+        rm += 1
+    rm += 1
+    for lbl in ["SP Government Website", "MXM Revenue Comission Account - 3110101"]:
+        ws.cell(rm, 8, lbl).font = font(size=9)
+        c = ws.cell(rm, 9, 0)
+        c.number_format = NUM_BRL; c.font = font(size=9)
+        c.alignment = Alignment(horizontal="right")
+        c.fill = fill(C_YELLOW); c.border = border()
+        rm += 1
+    rm += 1
+    c = ws.cell(rm, 9, 0)
+    c.fill = fill(C_YELLOW); c.number_format = NUM_BRL
+    c.border = Border(bottom=Side(style="medium"))
+    c.alignment = Alignment(horizontal="right")
+    rm += 1
+    ws.cell(rm, 8, "← Variance: SP Gov Website vs MXM Commission Account (should be zero)").font = font(italic=True, size=8, color="888888")
+
+
+# ============================================================
+# REBILLED INV SHEET
+# ============================================================
+# Columns for the CM section (from BR Trans from period schema)
+TRX_COLS_CM = [
+    "Ledger","OU NAME","Legal Entity","Company","Currency","CLASS",
+    "Transaction Number","TRX Type Name","Customer Name","Account Number",
+    "Contract No.","TRX DATE","GL Date","Entered Amt","Functional Amt",
+    "Conversion Rate","USD Amount","Invoice Print Date","Reference",
+    "Comments","Reason Code","Sales Manager","Receipt Method",
+    "City","Country","Amount In Dispute","Dispute Date",
+    "Hotel ID","Term Name","Created By User"
+]
+# Amount column indices (1-based) for CM schema
+CM_AMT_COLS = {14, 15, 16, 17}  # Entered Amt, Functional Amt, Conversion Rate, USD Amount
+
+# Columns for the Credited/Rebilled sections (Transaction Register Detail schema)
+TRX_COLS_DETAIL = [
+    "POAR Super Region","Ledger","OU NAME","Legal Entity","Company",
+    "Currency","CLASS","XLR ID","Transaction Number","TRX Type Name",
+    "Customer Name","Account Number","TRX DATE","GL Date","Year / Month",
+    "Entered Amt","Open Balance","Functional Amt","Conversion Rate","USD Amount",
+    "Invoice Print Date","Reference","Comments","Batch Name","Reason Code",
+    "Receipt Method","City","Country","Tax Amount","Amount In Dispute",
+    "TRX ON DISPUTE","Dispute Date","Hotel ID","Term Name","Created By User",
+    "Business Model","TRX Type","AP Status"
+]
+# Amount column indices (1-based) for detail schema
+DETAIL_AMT_COLS = {16, 17, 18, 19, 20, 29, 30}  # Entered, Open Balance, Functional, Conv Rate, USD, Tax, Dispute
+
+
+def _get_cm_nums(df_trans):
+    """Extract credited INV numbers and rebilled INV numbers from REBILL-OWNERSHIP CHANGE CMs."""
+    df = df_trans.copy()
+    df.columns = [c.upper().strip() for c in df.columns]
+
+    cms = df[
+        (df["CLASS"] == "CM") &
+        (df["REASON CODE"] == "REBILL-OWNERSHIP CHANGE") &
+        (~df["TRX TYPE NAME"].str.contains("RELO", na=False))
+    ]
+
+    # Extract credited INV numbers from CM Reference field
+    credited_nums = set()
+    for _, row in cms.iterrows():
+        ref = str(row.get("REFERENCE", "") or "")
+        m = re.search(r'CREDIT INVOICE (\d+)', ref)
+        if m:
+            credited_nums.add(int(m.group(1)))
+
+    rebilled_nums = set()
+    if credited_nums:
+        credited_rows = df[
+            (df["CLASS"] == "INV") &
+            (df["TRANSACTION NUMBER"].astype(str).isin([str(n) for n in credited_nums]))
+        ]
+
+        # Build match keys: (account_number_str, rounded_abs_amount)
+        # Use round(2) to avoid float precision mismatches from Oracle Decimal
+        keys = set()
+        for _, r in credited_rows.iterrows():
+            acct = str(r["ACCOUNT NUMBER"]).strip()
+            try:
+                amt_key = round(float(abs(r["ENTERED AMT"] or 0)), 2)
+            except (TypeError, ValueError):
+                continue
+            keys.add((acct, amt_key))
+
+        log.info(f"  Match keys for rebill lookup: {keys}")
+
+        # Warn if any credited INV is itself a BR_DIR_INV_REBILL
+        # These are still valid rebills — include them as rebill candidates too
+        for _, r in credited_rows.iterrows():
+            if str(r.get("TRX TYPE NAME", "")).strip() == "BR_DIR_INV_REBILL":
+                log.warning(
+                    f"  INV {r['TRANSACTION NUMBER']} is itself a BR_DIR_INV_REBILL "
+                    f"(hotel {r['ACCOUNT NUMBER']}, amt {r['ENTERED AMT']}) — "
+                    f"including as rebill in Rebilled section"
+                )
+                rebilled_nums.add(int(r["TRANSACTION NUMBER"]))
+
+        # Find BR_DIR_INV_REBILL candidates in df_trans
+        rebill_candidates = df[
+            (df["CLASS"] == "INV") &
+            (df["TRX TYPE NAME"] == "BR_DIR_INV_REBILL")
+        ]
+        log.info(f"  BR_DIR_INV_REBILL rows in period: {len(rebill_candidates)}")
+
+        for _, r in rebill_candidates.iterrows():
+            acct = str(r["ACCOUNT NUMBER"]).strip()
+            try:
+                amt_key = round(float(abs(r["ENTERED AMT"] or 0)), 2)
+            except (TypeError, ValueError):
+                continue
+            if (acct, amt_key) in keys:
+                rebilled_nums.add(int(r["TRANSACTION NUMBER"]))
+
+    return cms, credited_nums, rebilled_nums
+
+
+def write_rebilled_inv(ws, df_trans, df_credited, df_rebilled, cms_df):
+    """
+    Populate the Rebilled Inv sheet with three sections:
+      1. CREDIT MEMOS         — from cms_df (BR Trans schema, TRX_COLS_CM)
+      2. CREDITED INVOICES    — from df_credited (TRX Detail schema, TRX_COLS_DETAIL)
+      3. REBILLED INVOICES    — from df_rebilled (TRX Detail schema, TRX_COLS_DETAIL)
+    """
+    ws.sheet_view.showGridLines = False
+
+    # Set column widths based on the wider detail schema
+    detail_widths = [16,12,28,26,10,10,8,14,18,22,30,14,12,12,14,
+                     14,14,14,14,14,20,30,60,20,24,16,16,10,12,14,
+                     14,14,12,14,16,24,12,10]
+    for i, w in enumerate(detail_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    if df_trans.empty:
+        ws.cell(1, 1, "No data available for this period.")
+        return
+
+    # Normalize cms_df columns
+    cms_df = cms_df.copy()
+    cms_df.columns = [c.upper().strip() for c in cms_df.columns]
+
+    row_idx = [1]
+    n_cm_cols     = len(TRX_COLS_CM)
+    n_detail_cols = len(TRX_COLS_DETAIL)
+
+    def section_hdr(title, bg, n_cols):
+        ws.merge_cells(f"A{row_idx[0]}:{get_column_letter(n_cols)}{row_idx[0]}")
+        c = ws.cell(row_idx[0], 1, title)
+        c.fill = fill(bg); c.font = font(bold=True, size=11)
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        c.border = border("medium"); row_idx[0] += 1
+
+    def col_hdrs(cols, bg=C_MID):
+        for ci, lbl in enumerate(cols, 1):
+            hdr(ws.cell(row_idx[0], ci, lbl), bg=bg, size=9)
+        row_idx[0] += 1
+
+    def data_rows(src_df, cols, amt_cols):
+        if src_df is None or src_df.empty:
+            row_idx[0] += 1   # blank row placeholder
+            return
+        src_upper = src_df.copy()
+        src_upper.columns = [c.upper().strip() for c in src_upper.columns]
+
+        for _, row in src_upper.iterrows():
+            for ci, col_lbl in enumerate(cols, 1):
+                val = row.get(col_lbl.upper())
+                if hasattr(val, 'item'): val = val.item()
+                if val is not None and not isinstance(val, (str, datetime, date)):
+                    try:
+                        if pd.isna(val): val = None
+                    except: pass
+                c = ws.cell(row_idx[0], ci, val)
+                c.font = font(size=9); c.border = border("hair")
+                c.alignment = Alignment(horizontal="left", vertical="center")
+                if ci in amt_cols and val is not None:
+                    c.number_format = NUM_BRL_NEG
+                    c.alignment = Alignment(horizontal="right", vertical="center")
+            row_idx[0] += 1
+
+        # Totals row
+        ws.merge_cells(f"A{row_idx[0]}:M{row_idx[0]}")
+        c = ws.cell(row_idx[0], 1, "TOTAL")
+        c.font = font(bold=True, size=9); c.fill = fill(C_GREEN)
+        c.border = border(); c.alignment = Alignment(horizontal="right")
+        # Entered Amt and USD Amount totals
+        for col_lbl in ["ENTERED AMT", "USD AMOUNT"]:
+            if col_lbl in src_upper.columns:
+                ci = next((i+1 for i, h in enumerate(cols) if h.upper() == col_lbl), None)
+                if ci:
+                    total = float(src_upper[col_lbl].sum())
+                    c2 = ws.cell(row_idx[0], ci, total)
+                    c2.font = font(bold=True, size=9); c2.fill = fill(C_GREEN)
+                    c2.border = border(); c2.number_format = NUM_BRL
+                    c2.alignment = Alignment(horizontal="right")
+        row_idx[0] += 1
+
+    # ── Section 1: CREDIT MEMOS ───────────────────────────
+    section_hdr("CREDIT MEMOS — REBILL-OWNERSHIP CHANGE", C_CM, n_cm_cols)
+    col_hdrs(TRX_COLS_CM)
+    data_rows(cms_df, TRX_COLS_CM, CM_AMT_COLS)
+    row_idx[0] += 1
+
+    # ── Section 2: CREDITED INVOICES ──────────────────────
+    section_hdr("CREDITED INVOICES (original invoices being credited)", C_INV, n_detail_cols)
+    col_hdrs(TRX_COLS_DETAIL)
+    data_rows(df_credited, TRX_COLS_DETAIL, DETAIL_AMT_COLS)
+    row_idx[0] += 1
+
+    # ── Section 3: REBILLED INVOICES ──────────────────────
+    section_hdr(
+        "REBILLED INVOICES — BR_DIR_INV_REBILL (substitutes, most recent first)",
+        C_REBILL, n_detail_cols)
+    col_hdrs(TRX_COLS_DETAIL)
+    # Sort by TRX DATE desc if column exists
+    if df_rebilled is not None and not df_rebilled.empty:
+        df_reb_sorted = df_rebilled.copy()
+        df_reb_sorted.columns = [c.upper().strip() for c in df_reb_sorted.columns]
+        if "TRX DATE" in df_reb_sorted.columns:
+            df_reb_sorted = df_reb_sorted.sort_values("TRX DATE", ascending=False)
+        data_rows(df_reb_sorted, TRX_COLS_DETAIL, DETAIL_AMT_COLS)
+    else:
+        row_idx[0] += 1
+    row_idx[0] += 1
+
+    # Footer note
+    ws.merge_cells(f"A{row_idx[0]}:H{row_idx[0]}")
+    ws.cell(row_idx[0], 1,
+        "NOTE: CMs referencing a DEBIT MEMO (e.g. CM 263000649) are included in the "
+        "Credit Memos section but have no corresponding INV in the sections below."
+    ).font = font(italic=True, size=8, color="888888")
+
+
+# ============================================================
+# SP GovUpdated PLACEHOLDER
+# ============================================================
+def write_sp_gov_placeholder(ws):
+    ws.sheet_view.showGridLines = False
+    ws.merge_cells("A1:D1")
+    c = ws.cell(1, 1, "SP Government Data")
+    c.fill = fill(C_DARK); c.font = font(bold=True, size=12, color=C_WHITE)
+    c.alignment = Alignment(horizontal="left", vertical="center")
+    ws.cell(3, 1, "⚠  This tab is populated manually with the download from the SP Government portal.").font = font(italic=True, size=9, color="888888")
+    ws.cell(4, 1, f"Reference period: {PERIOD_LABEL}").font = font(italic=True, size=9, color=C_MID)
+    ws.column_dimensions["A"].width = 70
+
+
+# ============================================================
 # MAIN
-# ==========================
+# ============================================================
 def main():
-    logger.info("=" * 60)
-    logger.info("Brazil GL Subledger Export - v6 FINAL")
-    logger.info(f"  Ledger  : {LEDGER_NAME}")
-    logger.info(f"  Period  : {PERIOD_NAME}")
-    logger.info(f"  Company : {COMPANY}")
-    logger.info(f"  Accounts: {ACCOUNTS}")
-    logger.info("  Output  : " + str(OUTPUT_FILE))
-    logger.info("=" * 60)
+    log.info("=" * 60)
+    log.info("Brazil MXM Closing Workbook Builder — FULL INTEGRATED")
+    log.info(f"  Period   : {PERIOD_NAME}  ({PERIOD_LABEL})")
+    log.info(f"  Dates    : {PERIOD_START_ORACLE} → {PERIOD_END_ORACLE}")
+    log.info(f"  As-of    : {AS_OF_DATE}")
+    log.info(f"  Output   : {OUTPUT_FILE}")
+    log.info("=" * 60)
 
-    initialize_oracle_client()
-    conn = get_oracle_connection()
-
-    params = {
-        "ar_app_id":   AR_APP_ID,
-        "ledger_name": LEDGER_NAME,
-        "period_name": PERIOD_NAME,
-        "company":     COMPANY,
-    }
+    init_oracle()
+    conn = get_conn()
 
     try:
-        logger.info("Executing query...")
-        df = fetch_query(conn, MAIN_QUERY, params)
-        logger.info(f"  Rows fetched: {len(df):,}")
-        logger.info("  Category breakdown:")
-        for cat, cnt in df["JOURNAL_CATEGORY"].value_counts().items():
-            logger.info(f"    {cat}: {cnt:,}")
+        # ── 1. GL Subledger ────────────────────────────────
+        log.info("Running GL Subledger query...")
+        df_gl = run_query(conn, SQL_GL, {
+            "ar_app_id":   AR_APP_ID,
+            "ledger_name": LEDGER,
+            "period_name": PERIOD_NAME,
+            "company":     COMPANY,
+        })
+        log.info(f"  GL rows: {len(df_gl):,}")
+        for cat, cnt in df_gl["JOURNAL_CATEGORY"].value_counts().items():
+            log.info(f"    {cat}: {cnt:,}")
+
+        # ── 2. Brazil Transactions ─────────────────────────
+        log.info("Running Brazil Transactions query...")
+        df_trans = run_query(conn, SQL_TRANS, {
+            "period_start": PERIOD_START_ORACLE,
+            "period_end":   PERIOD_END_ORACLE,
+        })
+        log.info(f"  Transactions rows: {len(df_trans):,}")
+        for cls, cnt in df_trans["CLASS"].value_counts().items():
+            log.info(f"    {cls}: {cnt:,}")
+
+        # ── 3. Brazil Adjustments ──────────────────────────
+        log.info("Running Adjustments query...")
+        df_adj = run_query(conn, SQL_ADJ, {
+            "adj_start": PERIOD_START_4Y,
+            "adj_end":   PERIOD_END_4Y,
+        })
+        log.info(f"  Adjustment rows: {len(df_adj):,}")
+
+        # ── 4. AR Aging 7 Buckets ──────────────────────────
+        log.info("Running AR Aging 7 Buckets query...")
+        df_aging = run_query(conn, SQL_AGING)
+        log.info(f"  Aging rows: {len(df_aging):,}")
+
+        # ── 5. TRX Detail for Credited + Rebilled INVs ─────
+        log.info("Extracting rebill transaction numbers from BR Transactions...")
+        cms_df, credited_nums, rebilled_nums = _get_cm_nums(df_trans)
+        log.info(f"  Credited INV numbers : {sorted(credited_nums)}")
+        log.info(f"  Rebilled INV numbers : {sorted(rebilled_nums)}")
+
+        df_credited = pd.DataFrame()
+        df_rebilled = pd.DataFrame()
+
+        if credited_nums:
+            log.info(f"  Running TRX Detail for {len(credited_nums)} credited invoice(s)...")
+            df_credited = run_trx_detail(conn, credited_nums)
+            log.info(f"  Credited INV rows: {len(df_credited):,}")
+
+            # Any credited INV that is itself a BR_DIR_INV_REBILL should also
+            # appear in the Rebilled section (e.g. INV 661526, GL_DATE in prior period)
+            if not df_credited.empty:
+                df_cred_upper = df_credited.copy()
+                df_cred_upper.columns = [c.upper().strip() for c in df_cred_upper.columns]
+                self_rebills = df_cred_upper[
+                    df_cred_upper["TRX TYPE NAME"] == "BR_DIR_INV_REBILL"
+                ]["TRANSACTION NUMBER"].tolist()
+                if self_rebills:
+                    log.info(f"  Credited INVs that are themselves rebills: {self_rebills} — adding to rebilled set")
+                    rebilled_nums.update(int(n) for n in self_rebills)
+
+        if rebilled_nums:
+            log.info(f"  Running TRX Detail for {len(rebilled_nums)} rebilled invoice(s)...")
+            df_rebilled = run_trx_detail(conn, rebilled_nums)
+            log.info(f"  Rebilled INV rows: {len(df_rebilled):,}")
 
     except oracledb.DatabaseError as e:
-        logger.error(f"Oracle error: {e}")
-        sys.exit(1)
+        log.error(f"Oracle error: {e}"); sys.exit(1)
     finally:
-        if conn:
-            conn.close()
-            logger.info("Connection closed")
+        conn.close()
+        log.info("Oracle connection closed.")
 
-    if df.empty:
-        logger.warning("No data returned. Check PERIOD_NAME, LEDGER_NAME, COMPANY.")
-        sys.exit(0)
+    # ── Build Workbook ─────────────────────────────────────
+    log.info("Building workbook...")
+    wb = Workbook()
 
-    # Fix LEDGER_NAME (query returns SEGMENT1, replace with actual ledger name)
-    df["LEDGER_NAME"] = LEDGER_NAME
+    # 1. Summary
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+    write_summary(ws_summary, df_trans, df_adj, df_gl)
+    log.info("  Summary written.")
 
-    # Save as CSV (UTF-8 BOM for Excel compatibility)
-    df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
-    logger.info(f"  Saved: {OUTPUT_FILE}")
+    # 2. GL with Subledger Detail
+    ws_gl = wb.create_sheet("GL with Subledger Detail")
+    df_to_sheet(df_gl, ws_gl)
+    log.info("  GL with Subledger Detail written.")
 
-    # Validation summary
-    logger.info("=" * 60)
-    logger.info("VALIDATION BY ACCOUNT")
-    for acct in ACCOUNTS:
-        sub = df[df["ACCOUNT"].astype(str) == acct]
-        if sub.empty:
-            logger.info(f"  Account {acct}: no data")
-            continue
-        net   = sub["ENTERED_AMT"].sum()
-        pn_ok = sub["PARTY_NAME"].notna().sum()
-        tn_ok = sub["TRANSACTION_NUMBER"].notna().sum()
-        gd_ok = sub["GL_DATE"].notna().sum()
-        logger.info(
-            f"  Account {acct}: {len(sub):,} rows | "
-            f"Net={net:>15,.2f} | "
-            f"Party={pn_ok:,}/{len(sub):,} | "
-            f"TrxNum={tn_ok:,}/{len(sub):,} | "
-            f"GL_Date={gd_ok:,}/{len(sub):,}"
-        )
-    logger.info("=" * 60)
-    logger.info("DONE")
-    logger.info(f"File: {OUTPUT_FILE}")
-    logger.info("=" * 60)
+    # 3. Brazil Adjustment
+    ws_adj = wb.create_sheet("Brazil Adjustment")
+    df_to_sheet(df_adj, ws_adj)
+    log.info("  Brazil Adjustment written.")
+
+    # 4. Brazil Transactions from period
+    ws_trans = wb.create_sheet("Brazil Transactions from period")
+    df_to_sheet(df_trans, ws_trans)
+    log.info("  Brazil Transactions from period written.")
+
+    # 5. Aging List Updated
+    ws_aging = wb.create_sheet("Aging List Updated")
+    df_to_sheet(df_aging, ws_aging)
+    log.info("  Aging List Updated written.")
+
+    # 6. SP GovUpdated (manual)
+    ws_sp = wb.create_sheet("SP GovUpdated")
+    write_sp_gov_placeholder(ws_sp)
+    log.info("  SP GovUpdated placeholder written.")
+
+    # 7. Rebilled Inv
+    ws_rebill = wb.create_sheet("Rebilled Inv")
+    write_rebilled_inv(ws_rebill, df_trans, df_credited, df_rebilled, cms_df)
+    log.info("  Rebilled Inv written.")
+
+    # Save
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(OUTPUT_FILE))
+    log.info(f"Saved: {OUTPUT_FILE}")
+
+    # ── Validation Summary ─────────────────────────────────
+    log.info("=" * 60)
+    log.info("VALIDATION SUMMARY")
+    if not df_trans.empty:
+        for cls in ["CM","DM","INV"]:
+            v = df_trans[df_trans["CLASS"] == cls]["ENTERED AMT"].sum()
+            log.info(f"  HC {cls}: {v:>15,.2f}")
+    if not df_gl.empty:
+        for cat in ["Credit Memos","Debit Memos","Sales Invoices","Adjustment"]:
+            v = df_gl[df_gl["JOURNAL_CATEGORY"] == cat]["ENTERED_AMT"].sum()
+            log.info(f"  GL {cat}: {v:>15,.2f}")
+    if not df_adj.empty:
+        log.info(f"  ADJ total: {df_adj['ENTERED AMOUNT'].sum():>15,.2f}")
+    log.info("=" * 60)
+    log.info("DONE")
+    log.info(f"Output: {OUTPUT_FILE}")
+    log.info("=" * 60)
 
 
 if __name__ == "__main__":
