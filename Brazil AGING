@@ -48,10 +48,10 @@ log = logging.getLogger(__name__)
 # ============================================================
 # CONFIG  <<<  UPDATE HERE FOR EACH PERIOD
 # ============================================================
-PERIOD_NAME   = "JUL-26"               # Oracle period string
-PERIOD_LABEL  = "July 2026"            # Human-readable label for Summary
+PERIOD_NAME   = "AUG-26"               # Oracle period string
+PERIOD_LABEL  = "August 2026"            # Human-readable label for Summary
 PERIOD_YEAR   = 2026                   # Numeric year
-PERIOD_MONTH  = 7                      # Numeric month (1-12)
+PERIOD_MONTH  = 8                      # Numeric month (1-12)
 
 # Oracle date filters — derived automatically from month/year
 import calendar
@@ -460,7 +460,7 @@ ar_inv_dm_cm AS (
 ),
 ar_payments AS (
     SELECT 'Brazil PL' AS ledger, '11115' AS company,
-        NULL AS account, HZP.PARTY_NAME AS customer,
+        NVL(PA.gl_account, '113001') AS account, HZP.PARTY_NAME AS customer,
         HCA.ACCOUNT_NUMBER AS bill_to_number,
         NVL(HCA.CUSTOMER_CLASS_CODE,'HOTEL') AS partner_category,
         'Payment' AS transaction_type, 'Payment' AS transaction_class,
@@ -482,6 +482,23 @@ ar_payments AS (
         LEFT JOIN AR.AR_CASH_RECEIPTS_ALL CR ON CR.CASH_RECEIPT_ID=PSA.CASH_RECEIPT_ID
         LEFT JOIN AR.HZ_CUST_ACCOUNTS HCA ON HCA.CUST_ACCOUNT_ID=NVL(CR.PAY_FROM_CUSTOMER,PSA.CUSTOMER_ID)
         LEFT JOIN AR.HZ_PARTIES HZP ON HZP.PARTY_ID=HCA.PARTY_ID
+        LEFT JOIN (
+            SELECT RAA.CASH_RECEIPT_ID, MIN(GCC.SEGMENT2) AS gl_account
+            FROM AR.AR_RECEIVABLE_APPLICATIONS_ALL RAA
+                JOIN AR.RA_CUST_TRX_LINE_GL_DIST_ALL RGL
+                    ON  RGL.CUSTOMER_TRX_ID = RAA.APPLIED_CUSTOMER_TRX_ID
+                    AND RGL.ACCOUNT_CLASS   = 'REC'
+                    AND RGL.LATEST_REC_FLAG = 'Y'
+                    AND RGL.ORG_ID          = 114
+                JOIN GL.GL_CODE_COMBINATIONS GCC
+                    ON  GCC.CODE_COMBINATION_ID = RGL.CODE_COMBINATION_ID
+                    AND GCC.SEGMENT1            = '11115'
+                    AND GCC.SEGMENT2            IN ('113001','113100')
+            WHERE RAA.STATUS  = 'APP'
+              AND RAA.DISPLAY = 'Y'
+              AND RAA.ORG_ID  = 114
+            GROUP BY RAA.CASH_RECEIPT_ID
+        ) PA ON PA.CASH_RECEIPT_ID = CR.CASH_RECEIPT_ID
     WHERE PSA.ORG_ID=114 AND PSA.CLASS='PMT'
       AND TRUNC(PSA.TRX_DATE) <= TRUNC(P.AS_OF_DATE)
       AND ((PSA.STATUS='OP' AND PSA.AMOUNT_DUE_REMAINING<>0)
@@ -1143,6 +1160,109 @@ def write_rebilled_inv(ws, df_trans, df_credited, df_rebilled, cms_df):
 
 
 # ============================================================
+# AGING LIST SHEET
+# ============================================================
+def write_aging_sheet(ws, df_aging):
+    """Write AR Aging sheet with OBI-style params header followed by data."""
+    ws.sheet_view.showGridLines = False
+
+    # Column widths for params table
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["D"].width = 22
+
+    # ── Params header table (rows 1-17, matching OBI layout) ──
+    # Title
+    ws.merge_cells("A1:D1")
+    c = ws.cell(1, 1, "AR Aging Report")
+    c.fill = fill(C_DARK)
+    c.font = font(bold=True, size=12, color=C_WHITE)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    c.border = border()
+    ws.row_dimensions[1].height = 18
+
+    params_rows = [
+        ("Reporting Level",    "Ledger",           None,  None),
+        ("Reporting Context",  "Brazil PL",        None,  None),
+        ("Order By",           "Customer Number",  None,  None),
+        ("As of Date",         AS_OF_DATE,         None,  None),
+        ("Bucket Name",        "DIRECT AGENCY",    None,  None),
+        ("Show On Account",    "Age",              None,  None),
+        ("Show Receipts At",   "Do Not Show",      None,  None),
+        ("Entered Currency",   None,               None,  None),
+        ("Transaction Class",  None,               None,  None),
+        ("Business Model",     None,               None,  None),
+        ("Engagement Class",   None,               None,  None),
+        ("Customer Name",      None,               "To",  None),
+        ("Customer Number",    None,               "To",  None),
+        ("Balance Due",        None,               "To",  None),
+        ("Transaction Type",   None,               "To",  None),
+    ]
+
+    for i, (label, val, to_label, to_val) in enumerate(params_rows, start=2):
+        cl = ws.cell(i, 1, label)
+        cl.fill = fill(C_GREY)
+        cl.font = font(size=9, bold=True)
+        cl.border = border("hair")
+        cl.alignment = Alignment(horizontal="left", vertical="center")
+
+        cv = ws.cell(i, 2, val)
+        cv.fill = fill(C_LIGHT)
+        cv.font = font(size=9)
+        cv.border = border("hair")
+        cv.alignment = Alignment(horizontal="left", vertical="center")
+
+        if to_label:
+            ct = ws.cell(i, 3, to_label)
+            ct.fill = fill(C_GREY)
+            ct.font = font(size=9, bold=True)
+            ct.border = border("hair")
+            ct.alignment = Alignment(horizontal="center", vertical="center")
+
+        if to_val:
+            ctv = ws.cell(i, 4, to_val)
+            ctv.fill = fill(C_LIGHT)
+            ctv.font = font(size=9)
+            ctv.border = border("hair")
+
+    # Blank separator row
+    HEADER_ROWS = len(params_rows) + 2   # title row + params rows + 1 blank
+
+    # ── Data starts after header ────────────────────────────
+    if df_aging is not None and not df_aging.empty:
+        # Write headers
+        for col_idx, col_name in enumerate(df_aging.columns, start=1):
+            c = ws.cell(HEADER_ROWS, col_idx, col_name)
+            hdr(c, bg=C_DARK, size=9)
+            ws.column_dimensions[get_column_letter(col_idx)].width = max(
+                min(len(str(col_name)) + 4, 40), 10)
+
+        # Write data
+        num_cols = df_aging.select_dtypes(include='number').columns.tolist()
+        for row_idx, row in enumerate(df_aging.itertuples(index=False), start=HEADER_ROWS + 1):
+            for col_idx, (col_name, val) in enumerate(zip(df_aging.columns, row), start=1):
+                c = ws.cell(row_idx, col_idx)
+                if hasattr(val, 'item'): val = val.item()
+                try:
+                    if pd.isna(val) and not isinstance(val, (str, datetime, date)):
+                        val = None
+                except: pass
+                c.value = val
+                c.font = font(size=9)
+                c.border = border("hair")
+                c.alignment = Alignment(horizontal="left", vertical="center")
+                if col_name in num_cols and val is not None:
+                    c.number_format = NUM_BRL_NEG
+                    c.alignment = Alignment(horizontal="right", vertical="center")
+
+        ws.freeze_panes = ws.cell(HEADER_ROWS + 1, 1)
+    else:
+        ws.cell(HEADER_ROWS, 1, "No aging data returned for this period.").font = font(
+            italic=True, size=9, color="888888")
+
+
+# ============================================================
 # SP GovUpdated PLACEHOLDER
 # ============================================================
 def write_sp_gov_placeholder(ws):
@@ -1271,7 +1391,7 @@ def main():
 
     # 5. Aging List Updated
     ws_aging = wb.create_sheet("Aging List Updated")
-    df_to_sheet(df_aging, ws_aging)
+    write_aging_sheet(ws_aging, df_aging)
     log.info("  Aging List Updated written.")
 
     # 6. SP GovUpdated (manual)
