@@ -44,6 +44,15 @@ Changes vs R2.7.4:
   FIX 4 - Remove Receipt Method from OC WEBADI
 
   FIX 5 - GROUP filter now also checks SOURCE_SYSTEM (HCA.ATTRIBUTE3)
+
+  FIX 6 - GROUP filter now also checks HZ_RELATIONSHIPS for an active
+          'MEMBER OF' / 'Group Customer and Property' relationship on the
+          hotel's PARTY_ID. This catches accounts whose Business_Model /
+          Source System fields don't say "GROUP" but are still linked to a
+          group parent via the TCA relationship (confirmed real-world case:
+          EID 1214332 / OID 1049125 - Business_Model = 'DIR', Source System
+          = 'APM', yet has an active MEMBER OF / Group Customer and Property
+          relationship in HZ_RELATIONSHIPS).
 """
 
 # -------------------- DEFAULT PATHS --------------------
@@ -102,6 +111,10 @@ SELECT
     HZP.PARTY_NUMBER,
     HCA.ATTRIBUTE1 AS EXPEDIA_ID,
     HZP.PARTY_NAME AS HOTEL_NAME,
+    -- GROUP_RELATIONSHIP_FLAG = source of truth for GROUP classification
+    -- (active MEMBER OF / Group Customer and Property relationship in HZ_RELATIONSHIPS).
+    -- TAI_BM / SOURCE_SYSTEM below are only secondary/legacy heuristics.
+    CASE WHEN GRP.SUBJECT_ID IS NOT NULL THEN 'GROUP' END AS GROUP_RELATIONSHIP_FLAG,
     TAI.Attribute1 AS TAI_PC,
     TAI.Business_Model AS TAI_BM,
     SITEOU.NAME AS SITE_OU,
@@ -184,6 +197,13 @@ LEFT JOIN
             ON TER.TERRITORY_CODE = HZP.COUNTRY
 LEFT JOIN XXEXPD.XXEXPD_TCA_ADDITIONAL_INFO TAI
     ON HCA.Cust_Account_ID = TAI.partner_id
+LEFT JOIN
+    (SELECT DISTINCT HR.SUBJECT_ID
+        FROM AR.HZ_RELATIONSHIPS HR
+            WHERE HR.RELATIONSHIP_CODE = 'MEMBER OF'
+                AND HR.RELATIONSHIP_TYPE = 'Group Customer and Property'
+                AND HR.END_DATE > SYSDATE) GRP
+                    ON GRP.SUBJECT_ID = HCA.PARTY_ID
 LEFT JOIN HZ_PARTY_SITES PS
     ON HZP.party_id = PS.party_id
 LEFT JOIN HR_OPERATING_UNITS SITEOU  
@@ -219,6 +239,19 @@ WHERE TRIM(
             ' '
         )
       ) IN ({hotel_names})
+  AND HCA.CUSTOMER_CLASS_CODE = 'SLE'
+"""
+
+# Checks whether a set of registration numbers already exist on any SLE in Oracle.
+ORACLE_TAX_ID_LOOKUP_SQL = """
+SELECT DISTINCT ZR.REGISTRATION_NUMBER
+FROM APPS.ZX_REGISTRATIONS ZR
+JOIN APPS.ZX_PARTY_TAX_PROFILE PTP
+    ON ZR.PARTY_TAX_PROFILE_ID = PTP.PARTY_TAX_PROFILE_ID
+JOIN AR.HZ_CUST_ACCOUNTS HCA
+    ON HCA.PARTY_ID = PTP.PARTY_ID
+WHERE ZR.REGISTRATION_NUMBER IN ({reg_numbers})
+  AND ZR.EFFECTIVE_TO IS NULL
   AND HCA.CUSTOMER_CLASS_CODE = 'SLE'
 """
 
@@ -2156,6 +2189,42 @@ def fetch_oracle_hotels_by_name(hotel_names: List[str], country_iso2_list: Optio
 
     return df_oracle
 
+
+def lookup_tax_ids_in_oracle(tax_ids: List[str]) -> set:
+    """
+    Given a list of numeric tax registration numbers, returns the subset that
+    already exist in Oracle on any SLE (CUSTOMER_CLASS_CODE='SLE').
+    Returns an empty set if the Oracle query fails or no matches are found.
+    """
+    valid = sorted({str(x).strip() for x in tax_ids if re.fullmatch(r"\d+", str(x).strip())})
+    if not valid:
+        return set()
+
+    print(f"\n[INFO] Checking {len(valid)} tax ID(s) against Oracle SLE registrations...")
+    ensure_oracle_client()
+
+    results: set = set()
+    try:
+        def _chunks(lst, n):
+            for i in range(0, len(lst), n):
+                yield lst[i:i + n]
+
+        for batch in _chunks(valid, 1000):
+            ids_literal = ", ".join(f"'{v}'" for v in batch)
+            sql = ORACLE_TAX_ID_LOOKUP_SQL.format(reg_numbers=ids_literal)
+            with oracledb.connect(user=ORACLE_USERNAME, password=ORACLE_PASSWORD, dsn=ORACLE_DSN) as con:
+                with con.cursor() as cur:
+                    cur.execute("ALTER SESSION SET CURRENT_SCHEMA = APPS")
+                with con.cursor() as cur:
+                    cur.execute(sql)
+                    for row in cur:
+                        results.add(str(row[0]).strip())
+        print(f"[INFO] Tax ID Oracle check done. {len(results)} existing registration(s) found.")
+    except Exception as e:
+        print(f"[WARN] Tax ID Oracle lookup failed: {e}. Skipping tax ID check.")
+
+    return results
+
 def add_sle_oid_from_legal_name(df: pd.DataFrame) -> pd.DataFrame:
     """
     FIX 1: pass both Legal Name AND Country ISO2 to fetch_oracle_hotels_by_name
@@ -2391,6 +2460,7 @@ def enrich_hcpif_with_oracle(
         oracle_fill_cols = [
             "ORACLE_ID", "HOTEL_NAME", "ORACLE_CURRENCY",
             "CURRENT_RM", "RECEIPT_METHOD_NAME", "SLE_NAME",
+            "GROUP_RELATIONSHIP_FLAG",
             "SLE_OID", "TAI_BM", "DUPLICATE_COUNT",
         ]
         for col in oracle_fill_cols:
@@ -2428,6 +2498,34 @@ def enrich_hcpif_with_oracle(
     else:
         merged["Currency Matches Oracle"] = pd.NA
 
+    # --- SLE Attach Status check (informational only - does NOT block WebADI) ---
+    # Compares the candidate "SLE OID" (found by matching the HCPIF Legal Name
+    # against existing SLE accounts in Oracle, see add_sle_oid_from_legal_name)
+    # with "SLE_OID" (the SLE that is ALREADY attached to this property today,
+    # via an active 'LEGAL ENTITY/OWNER OF' relationship in HZ_RELATIONSHIPS,
+    # fetched per-property in ORACLE_TCA_SQL_TEMPLATE). This is only a flag for
+    # manual double-check in the extraction file before the Attach SLE WebADI
+    # is sent - it does not stop/filter any row.
+    def _norm_sle_value(v) -> str:
+        s = str(v).strip() if v is not None else ""
+        return s if s and s.lower() not in ("nan", "none", "<na>") else ""
+
+    candidate_sle_series = merged.get("SLE OID", pd.Series([""] * len(merged))).map(_norm_sle_value)
+    existing_sle_series = merged.get("SLE_OID", pd.Series([""] * len(merged))).map(_norm_sle_value)
+
+    def _sle_attach_status(candidate: str, existing: str) -> Optional[str]:
+        if not candidate:
+            return None
+        if not existing:
+            return "Not Attached - OK to Attach"
+        if candidate == existing:
+            return "Already Attached (Same SLE)"
+        return f"Already Attached to DIFFERENT SLE ({existing}) - REVIEW"
+
+    merged["SLE Attach Status"] = [
+        _sle_attach_status(c, e) for c, e in zip(candidate_sle_series, existing_sle_series)
+    ]
+
     comment_col = "Comments"
     new_comment = merged.get("file_name", pd.Series([""] * len(merged))).apply(
         lambda fn: f"Updated Ownership per HCPIF - {format_comment_from_filename(fn)}"
@@ -2440,6 +2538,26 @@ def enrich_hcpif_with_oracle(
         )
     else:
         merged[comment_col] = new_comment
+
+    # --- Tax ID Oracle existence check ---
+    # For any HCPIF row with a valid numeric-only Tax Registration Number,
+    # query Oracle to see if that number already exists on any SLE.
+    # Result is a "Tax ID Oracle Status" column in the extraction file for manual review.
+    if "Tax Registration Number" in merged.columns:
+        _numeric_tax_ids = [
+            v for v in merged["Tax Registration Number"].dropna().unique()
+            if re.fullmatch(r"\d+", str(v).strip())
+        ]
+        if _numeric_tax_ids:
+            _existing = lookup_tax_ids_in_oracle(_numeric_tax_ids)
+            def _tax_status(v):
+                if pd.isna(v) or not str(v).strip():
+                    return None
+                return "Tax ID already exists" if (re.fullmatch(r"\d+", str(v).strip()) and str(v).strip() in _existing) else None
+            merged["Tax ID Oracle Status"] = merged["Tax Registration Number"].apply(_tax_status)
+        else:
+            merged["Tax ID Oracle Status"] = None
+    # --- end Tax ID Oracle check ---
 
     oracle_key_cols = [c for c in ["Expedia ID", "Country ISO2", "file_name", "file_path"] if c in merged.columns]
     exclude_for_details = set(base_columns) | {
@@ -2457,12 +2575,25 @@ def enrich_hcpif_with_oracle(
     series_rm = merged.get("RECEIPT_METHOD_NAME", pd.Series([""] * len(merged))).astype(str)
     mask_direct_debit = series_rm.str.contains("DIRECT DEBIT", case=False, na=False)
 
+    # GROUP classification - source of truth first.
+    # GROUP_RELATIONSHIP_FLAG comes from an ACTIVE 'MEMBER OF' / 'Group Customer
+    # and Property' relationship in HZ_RELATIONSHIPS (the hotel's PARTY_ID linked
+    # to a group parent party). This is the authoritative signal: if Oracle says
+    # there's a live group relationship, the account IS a group account, period -
+    # regardless of what Business_Model/Source System say. Those two are only
+    # secondary/legacy heuristics kept for accounts that predate this relationship
+    # check or that don't have a HZ_RELATIONSHIPS row for some other reason.
+    series_group_rel = merged.get("GROUP_RELATIONSHIP_FLAG", pd.Series([""] * len(merged))).astype(str)
+    mask_group_relationship = series_group_rel.str.contains("GROUP", case=False, na=False)
+
     series_tai = merged.get("TAI_BM", pd.Series([""] * len(merged))).astype(str)
     series_source = merged.get("SOURCE_SYSTEM", pd.Series([""] * len(merged))).astype(str)
-    mask_tai_group = (
+    mask_group_legacy = (
         series_tai.str.contains("GROUP", case=False, na=False) |
         series_source.str.contains("GROUP", case=False, na=False)
     )
+
+    mask_tai_group = mask_group_relationship | mask_group_legacy
 
     # --- CHANGE 1: Collect Type classification (HC vs EC) ---
     # HC = RECEIPT_METHOD_NAME non-empty AND does not contain "EVC" or "Virtual"
@@ -2494,7 +2625,7 @@ def enrich_hcpif_with_oracle(
         has_sle_oid = merged["SLE_OID"].notna() & (~merged["SLE_OID"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
 
     mask_no_oid_at_all = (~has_hotel_oid) & (~has_sle_oid if isinstance(has_sle_oid, pd.Series) else True)
-    mask_not_group = ~series_tai.str.contains("GROUP", case=False, na=False)
+    mask_not_group = ~mask_tai_group
     mask_collect_hc = merged["Collect Type"] == "HC"
 
     mask_no_oid_hc = mask_no_oid_at_all & mask_not_group & mask_collect_hc
@@ -2510,6 +2641,7 @@ def enrich_hcpif_with_oracle(
     extra_cols = [
         "Found Hotel OID", "Found Hotel Name", "Oracle Currency",
         "Currency Matches Oracle", "Comments", "Current RM", "Collect Type",
+        "Tax ID Oracle Status", "SLE Attach Status",
     ]
     final_main_cols = list(base_columns)
     for col in extra_cols:
@@ -2677,7 +2809,7 @@ def inject_into_webadi_update(
         "HOTEL_ID": "Expedia ID",
         "EFFECTIVE_DATE": "Effective Date of Change",
         "CUSTOMER_NAME": "Hotel Name",
-        "TAX_REG_NUM": "Tax Registration Number",
+        "TAX_REG_NUMBER": "Tax Registration Number",
         "TAX_REGIME_CODE": "WEBADI_TAX_REGIME_CODE",
         "TAX": "WEBADI_TAX",
         "TAX_REG_STATUS": "Tax Registration Status",
@@ -2769,6 +2901,19 @@ def inject_into_webadi_update(
                     ws.cell(current, col_idx).value = comment_text
                 else:
                     ws.cell(current, col_idx).value = None
+
+            # TAX_REG_NUM: block generic/placeholder text (e.g. "Registered", "Select a status")
+            # and values with no alphanumeric content. Legitimate IDs with letters (e.g. "MT12345678")
+            # pass through unchanged. The extraction file is unaffected; this filter is WebADI-only.
+            elif webadi_col == "TAX_REG_NUMBER":
+                if _is_blank(val):
+                    ws.cell(current, col_idx).value = None
+                elif TRN_BAD.match(str(val).strip()):
+                    ws.cell(current, col_idx).value = None
+                elif not re.search(r"[A-Za-z0-9]", str(val).strip()):
+                    ws.cell(current, col_idx).value = None
+                else:
+                    ws.cell(current, col_idx).value = str(val).strip()
 
             # TAX_REG_STATUS: "REGISTERED" if contains "REGISTERED"
             elif webadi_col == "TAX_REG_STATUS":
@@ -3471,6 +3616,18 @@ def enrich_df2_with_country_tax(df2: pd.DataFrame) -> pd.DataFrame:
     )
 
     df2["WEBADI_COUNTRY"] = df2["MAP_COUNTRY"]
+
+    # Fallback for countries missing from the mapping file (e.g. Malta "MT"):
+    # if WEBADI_COUNTRY is still blank after the merge, derive the ISO2 code via to_iso2().
+    mask_blank = (
+        df2["WEBADI_COUNTRY"].isna()
+        | (df2["WEBADI_COUNTRY"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
+    )
+    if mask_blank.any():
+        df2.loc[mask_blank, "WEBADI_COUNTRY"] = df2.loc[mask_blank, "Country"].apply(
+            lambda c: to_iso2(c) or None
+        )
+
     df2["WEBADI_TAX_REGIME_CODE"] = df2["TAX_REGIME_CODE"]
     df2["WEBADI_TAX"] = df2["TAX"]
 
