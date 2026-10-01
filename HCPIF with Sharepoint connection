@@ -892,6 +892,52 @@ CURRENCY_WORD_MAP: Dict[str, str] = {
     "CORONA": "SEK",
 }
 
+# FIX 7 - maps a "local" currency code to what Oracle actually settles it as,
+# for countries whose local currency has NO active Receipt Method in Oracle
+# (i.e. NEVER shows up in AR_CASH_RECEIPTS_ALL - money is never actually
+# received in that currency, even if invoices are occasionally raised in it).
+#
+# Built from "Currencies accepted in Oracle by WIRE.xlsx" cross-referenced
+# live against Oracle (AR.RA_CUSTOMER_TRX_ALL / AR.AR_CASH_RECEIPTS_ALL):
+#   1) Found every country whose official/local currency never appears as an
+#      accepted WIRE settlement currency for that country (only USD/EUR/GBP/
+#      etc. do) - candidate "exotic, no pair" currencies.
+#   2) For each candidate currency code, checked real Oracle usage. Codes
+#      with real rows in AR_CASH_RECEIPTS_ALL (an ACTIVE Receipt Method) were
+#      EXCLUDED - e.g. COP (Colombia), AUD, NOK, HUF, MAD, JOD, KWD, etc. all
+#      have real receipts and must NOT be converted.
+#   3) Only codes with ZERO receipt activity (whether zero usage anywhere, or
+#      invoice-only with no matching receipt - same pattern as FJD/BWP) were
+#      kept, then mapped to the currency their country(ies) DO accept via
+#      WIRE (USD preferred, else EUR, else GBP).
+#
+# IMPORTANT: do NOT add a currency here just because it's absent from the
+# WIRE file - always confirm zero AR_CASH_RECEIPTS_ALL activity first. A
+# currency absent from WIRE but paid via another method (e.g. BRL/boleto)
+# must stay untouched.
+ORACLE_WIRE_CURRENCY_FALLBACK: Dict[str, str] = {
+    # -> USD
+    "ALL": "USD", "AMD": "USD", "ANG": "USD", "AOA": "USD", "AWG": "USD",
+    "AZN": "USD", "BBD": "USD", "BDT": "USD", "BIF": "USD", "BND": "USD",
+    "BOB": "USD", "BTN": "USD", "BWP": "USD", "BYN": "USD", "BZD": "USD",
+    "CDF": "USD", "DZD": "USD", "ERN": "USD", "ETB": "USD", "FJD": "USD",
+    "FKP": "USD", "GEL": "USD", "GHS": "USD", "GMD": "USD", "GNF": "USD",
+    "GYD": "USD", "KGS": "USD", "KHR": "USD", "KYD": "USD", "KZT": "USD",
+    "LAK": "USD", "LBP": "USD", "LRD": "USD", "LSL": "USD", "MDL": "USD",
+    "MGA": "USD", "MKD": "USD", "MNT": "USD", "MOP": "USD", "MRU": "USD",
+    "MVR": "USD", "MWK": "USD", "MZN": "USD", "NAD": "USD", "NGN": "USD",
+    "NIO": "USD", "NPR": "USD", "PGK": "USD", "PKR": "USD", "PYG": "USD",
+    "QAR": "USD", "RWF": "USD", "SCR": "USD", "SLL": "USD", "STN": "USD",
+    "SZL": "USD", "TJS": "USD", "TTD": "USD", "TZS": "USD", "UGX": "USD",
+    "UYU": "USD", "UZS": "USD", "VES": "USD", "WST": "USD", "XAF": "USD",
+    "XCD": "USD", "XPF": "USD", "ZMW": "USD", "ZWL": "USD",
+    # -> EUR
+    "BAM": "EUR", "DJF": "EUR", "GIP": "EUR", "KMF": "EUR", "LYD": "EUR",
+    "RSD": "EUR", "XOF": "EUR",
+    # -> GBP
+    "SHP": "GBP",
+}
+
 def normalize_currency_word(raw: str) -> Optional[str]:
     """
     Convert free-text currency names to ISO-4217 codes.
@@ -1015,6 +1061,20 @@ def is_valid_date_token(token: str) -> bool:
         except ValueError:
             continue
     return False
+
+
+def parse_hcpif_date(token: Optional[str]) -> Optional[datetime]:
+    """Parses a date string extracted from the HCPIF (any DATE_PATTERNS format)
+    into a datetime. Returns None if blank/unparseable."""
+    if not token:
+        return None
+    token = str(token).strip()
+    for fmt in DATE_PATTERNS:
+        try:
+            return datetime.strptime(token, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def extract_first_date_token(s: Optional[str]) -> Optional[str]:
@@ -1742,6 +1802,11 @@ def extract_fields_positional(pdf_path: Path) -> Dict[str, Optional[str]]:
             if not re.fullmatch(r"[A-Z]{3}", c):
                 m = re.search(r"\b([A-Z]{3})\b", c)
                 c = m.group(1).upper() if m else None
+            # FIX 7: convert "local" currencies that Oracle never actually
+            # settles as-is via WIRE (see ORACLE_WIRE_CURRENCY_FALLBACK above)
+            # BEFORE the KNOWN_CURRENCIES check.
+            if c and c in ORACLE_WIRE_CURRENCY_FALLBACK:
+                c = ORACLE_WIRE_CURRENCY_FALLBACK[c]
             if c and c not in KNOWN_CURRENCIES:
                 c = None
             results["Currency"] = c
@@ -2418,16 +2483,16 @@ def create_sle_match_review_tab(df: pd.DataFrame, df_oracle: pd.DataFrame) -> pd
 
 def enrich_hcpif_with_oracle(
         df: pd.DataFrame, base_columns: List[str]
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if "Expedia ID" not in df.columns:
         print("[WARN] Column 'Expedia ID' not found; skipping Oracle enrichment.")
-        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     expedia_ids = df["Expedia ID"].tolist()
     df_oracle = fetch_oracle_tca(expedia_ids)
     if df_oracle.empty:
         print("[INFO] No Oracle data returned; HCPIF remains without enrichment.")
-        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     df["Expedia ID"] = df["Expedia ID"].astype(str).str.strip()
     if "Country ISO2" not in df.columns:
@@ -2604,16 +2669,35 @@ def enrich_hcpif_with_oracle(
     merged["Collect Type"] = "EC"
     merged.loc[mask_rm_present & ~mask_rm_evc_virtual, "Collect Type"] = "HC"
 
-    mask_excluded = mask_direct_debit | mask_tai_group
+    # --- FIX 8: Future Effective Date of Change -> blocked from all WebADIs ---
+    # If the HCPIF's "Effective Date of Change" is a date AFTER today, the row
+    # cannot be processed yet (the change isn't effective yet) - it must be
+    # held out of all 3 WebADI outputs and reviewed manually until the date
+    # arrives. Takes priority over DIRECT DEBIT/GROUP tab assignment (a row is
+    # never double-counted in those tabs), but is still excluded from the
+    # final WebADI set the same way.
+    today_date = datetime.now().date()
+
+    def _is_future_date(raw) -> bool:
+        parsed = parse_hcpif_date(raw)
+        return bool(parsed and parsed.date() > today_date)
+
+    series_effective_date = merged.get("Effective Date of Change", pd.Series([None] * len(merged)))
+    mask_future_date = series_effective_date.apply(_is_future_date)
+
+    mask_excluded = mask_direct_debit | mask_tai_group | mask_future_date
 
     df_main_raw = merged[~mask_excluded].copy()
-    df_excluded_dd_raw = merged[mask_direct_debit & ~mask_tai_group].copy()
-    df_excluded_group_raw = merged[mask_tai_group].copy()
+    df_excluded_dd_raw = merged[mask_direct_debit & ~mask_tai_group & ~mask_future_date].copy()
+    df_excluded_group_raw = merged[mask_tai_group & ~mask_future_date].copy()
+    df_future_date_raw = merged[mask_future_date].copy()
 
     if not df_excluded_dd_raw.empty:
         print(f"[INFO] {len(df_excluded_dd_raw)} row(s) flagged for DIRECT DEBIT review.")
     if not df_excluded_group_raw.empty:
         print(f"[INFO] {len(df_excluded_group_raw)} row(s) flagged for GROUP review.")
+    if not df_future_date_raw.empty:
+        print(f"[INFO] {len(df_future_date_raw)} row(s) flagged for FUTURE DATE review (Effective Date of Change > today).")
 
     # --- CHANGE 2: Split no-OID rows into HC and EC review tabs ---
     # Rows where BOTH Found Hotel OID and SLE OID are blank AND TAI_BM is not GROUP.
@@ -2628,8 +2712,8 @@ def enrich_hcpif_with_oracle(
     mask_not_group = ~mask_tai_group
     mask_collect_hc = merged["Collect Type"] == "HC"
 
-    mask_no_oid_hc = mask_no_oid_at_all & mask_not_group & mask_collect_hc
-    mask_no_oid_ec = mask_no_oid_at_all & mask_not_group & ~mask_collect_hc
+    mask_no_oid_hc = mask_no_oid_at_all & mask_not_group & mask_collect_hc & ~mask_future_date
+    mask_no_oid_ec = mask_no_oid_at_all & mask_not_group & ~mask_collect_hc & ~mask_future_date
 
     df_no_oid_hc_raw = merged[mask_no_oid_hc].copy()
     df_no_oid_ec_raw = merged[mask_no_oid_ec].copy()
@@ -2655,11 +2739,13 @@ def enrich_hcpif_with_oracle(
     df_no_oid_ec = df_no_oid_ec_raw.loc[:, safe_cols].copy() if not df_no_oid_ec_raw.empty else pd.DataFrame()
     safe_cols_hc = [c for c in final_main_cols if c in df_no_oid_hc_raw.columns]
     df_no_oid_hc = df_no_oid_hc_raw.loc[:, safe_cols_hc].copy() if not df_no_oid_hc_raw.empty else pd.DataFrame()
+    safe_cols_future = [c for c in final_main_cols if c in df_future_date_raw.columns]
+    df_future_date = df_future_date_raw.loc[:, safe_cols_future].copy() if not df_future_date_raw.empty else pd.DataFrame()
 
     # Create SLE match review tab
     df_sle_review = create_sle_match_review_tab(df_main, df_oracle)
 
-    return df_main, df_excluded_dd, df_excluded_group, df_oracle_details, df_no_oid_ec, df_no_oid_hc, df_sle_review
+    return df_main, df_excluded_dd, df_excluded_group, df_oracle_details, df_no_oid_ec, df_no_oid_hc, df_sle_review, df_future_date
 
 
 def normalize_language_to_code(val: Optional[str]) -> Optional[str]:
@@ -3803,7 +3889,7 @@ def main():
 
     base_columns = list(df.columns)
 
-    df, df_excluded_dd, df_excluded_group, df_oracle_details, df_no_oid_ec, df_no_oid_hc, df_sle_review = enrich_hcpif_with_oracle(df, base_columns)
+    df, df_excluded_dd, df_excluded_group, df_oracle_details, df_no_oid_ec, df_no_oid_hc, df_sle_review, df_future_date = enrich_hcpif_with_oracle(df, base_columns)
 
     df = sanitize_legal_name_column(df)
     if not df_excluded_dd.empty:
@@ -3915,6 +4001,16 @@ def main():
                     writer, sheet_name="Review - SLE Match", index=False
                 )
                 print(f"[INFO] {len(df_sle_review)} row(s) written to 'Review - SLE Match' tab.")
+            # ── END NEW ─────────────────────────────────────────────────────
+
+            # ── NEW (FIX 8): write Review - Future Date tab ────────────────
+            # Rows blocked from all 3 WebADIs because Effective Date of
+            # Change is after today - cannot be processed until that date.
+            if not df_future_date.empty:
+                df_future_date.to_excel(
+                    writer, sheet_name="Review - Future Date", index=False
+                )
+                print(f"[INFO] {len(df_future_date)} row(s) written to 'Review - Future Date' tab.")
             # ── END NEW ─────────────────────────────────────────────────────
 
             # ── NEW: write Review - EID Mismatch tab ────────────────────────
